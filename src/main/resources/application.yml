@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: linked-store-backend
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/linked_store
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      idle-timeout: 300000
+      connection-timeout: 20000
+
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 20MB
+      max-request-size: 25MB
+      file-size-threshold: 2MB
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: UTC
+        order_updates: true
+        order_inserts: true
+        batch:
+          versioned_data: true
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    property-naming-strategy: SNAKE_CASE
+
+  scheduling:
+    pool:
+      size: 4
+
+stripe:
+  api-key: ${STRIPE_SECRET_KEY:sk_test_placeholder}
+  public-key: ${STRIPE_PUBLIC_KEY:pk_test_placeholder}
+  webhook-secret: ${STRIPE_WEBHOOK_SECRET:whsec_placeholder}
+  platform-fee-percent: 0
+  subscription:
+    plus-price-id: ${SUBSCRIPTION_PLUS_STRIPE_PRICE_ID:}
+    pro-price-id: ${SUBSCRIPTION_PRO_STRIPE_PRICE_ID:}
+
+cloudflare:
+  r2:
+    account-id: ${R2_ACCOUNT_ID:}
+    access-key-id: ${R2_ACCESS_KEY_ID:}
+    secret-access-key: ${R2_SECRET_ACCESS_KEY:}
+    bucket-name: ${R2_BUCKET_NAME:share}
+    endpoint: ${R2_ENDPOINT:}
+    public-url: ${R2_PUBLIC_URL:}
+    image-max-bytes: 20971520
+
+inventory:
+  lock-minutes: 15
+  expiry-scheduler-seconds: 30
+
+server:
+  port: 8080
+  address: 0.0.0.0
+  servlet:
+    context-path: /
+
+seed:
+  catalog: true
+
+linkedstore:
+  auth:
+    jwt-secret: ${LINKEDSTORE_AUTH_JWT_SECRET:linked-store-dev-super-secret-key-please-change-in-production-64chars-Minimum!!OK}
+    access-token-minutes: ${LINKEDSTORE_AUTH_ACCESS_TOKEN_MINUTES:30}
+    refresh-token-days: ${LINKEDSTORE_AUTH_REFRESH_TOKEN_DAYS:7}
+    issuer: ${LINKEDSTORE_AUTH_ISSUER:linked-store}
+    default-admin-email: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_EMAIL:admin@linked.store}
+    default-admin-password: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_PASSWORD:Admin123!}

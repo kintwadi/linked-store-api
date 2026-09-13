@@ -1,0 +1,28 @@
+# Build
+target/
+build/
+*.class
+*.jar
+*.log
+
+# IDE / IntelliJ / Eclipse
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+
+# Secrets and credentials - NEVER push these
+*.bat
+private.md
+*.env
+.env
+setup.env.properties
+backend_latest.log
+
+# OS
+.DS_Store
+Thumbs.db
