@@ -85,4 +85,8 @@ public interface ProductVariantRepository extends JpaRepository<ProductVariant, 
         WHERE pv.id = :variantId
     """)
     Optional<ProductVariant> findByIdWithProduct(@Param("variantId") UUID variantId);
+
+    List<ProductVariant> findByStoreId(UUID storeId);
+
+    Optional<ProductVariant> findByIdAndStoreId(UUID id, UUID storeId);
 }

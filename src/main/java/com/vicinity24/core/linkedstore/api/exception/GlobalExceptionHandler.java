@@ -273,16 +273,38 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiErrorResponse> handleDataIntegrity(
             DataIntegrityViolationException ex, HttpServletRequest request) {
-        log.error("Data integrity violation: {}", ex.getMessage());
+        log.error("Data integrity violation: {}", ex.getMessage(), ex);
+        String constraintName = extractConstraintName(ex);
+        String detail = constraintName != null ? " Constraint: %s.".formatted(constraintName) : "";
         ApiErrorResponse body = ApiErrorResponse.builder()
                 .timestamp(OffsetDateTime.now())
                 .status(HttpStatus.CONFLICT.value())
                 .error("Data Integrity Violation")
-                .message("A database constraint was violated. Please check your input.")
+                .message("A database constraint was violated. Please check your input.%s".formatted(detail))
                 .path(request.getRequestURI())
                 .errorCode("DATA_INTEGRITY_VIOLATION")
                 .build();
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    private static String extractConstraintName(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null) {
+                java.util.regex.Matcher m1 = java.util.regex.Pattern
+                        .compile("\"([^\"]+_PK|[^\"]+_uk_[^\"]+|[^\"]+_unique_[^\"]+|[^\"]+)",
+                                java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(msg);
+                if (m1.find()) return m1.group(1);
+                java.util.regex.Matcher m2 = java.util.regex.Pattern
+                        .compile("constraint\\s*[`\"]([^`\"]+)[`\"]", java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(msg);
+                if (m2.find()) return m2.group(1);
+            }
+            cur = cur.getCause();
+        }
+        return null;
     }
 
     @ExceptionHandler(ImageStorageException.class)

@@ -9,7 +9,9 @@ import lombok.NoArgsConstructor;
 import org.hibernate.annotations.Type;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -19,7 +21,7 @@ import java.util.UUID;
 @NoArgsConstructor
 @AllArgsConstructor
 @Table(name = "product_variants",
-        uniqueConstraints = @UniqueConstraint(columnNames = {"sku"}))
+        uniqueConstraints = @UniqueConstraint(name = "uk_product_variants_store_sku", columnNames = {"store_id", "sku"}))
 public class ProductVariant {
 
     @Id
@@ -40,7 +42,7 @@ public class ProductVariant {
     @JoinColumn(name = "store_id", insertable = false, updatable = false)
     private Store store;
 
-    @Column(name = "sku", nullable = false, length = 100)
+    @Column(name = "sku", length = 100)
     private String sku;
 
     @Column(name = "wholesale_price_cents", nullable = false)
@@ -71,6 +73,11 @@ public class ProductVariant {
     @Column(name = "image_url", length = 1024)
     private String imageUrl;
 
+    @Type(JsonType.class)
+    @Column(name = "gallery_image_urls", columnDefinition = "jsonb")
+    @Builder.Default
+    private List<String> galleryImageUrls = new ArrayList<>();
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
@@ -88,6 +95,9 @@ public class ProductVariant {
         }
         if (version == null) {
             version = 0;
+        }
+        if (galleryImageUrls == null) {
+            galleryImageUrls = new ArrayList<>();
         }
     }
 }

@@ -43,6 +43,8 @@ public class ImageController {
                 }
                 yield imageStorageService.uploadVariantImage(storeId, parentId, file);
             }
+            case "pending_product" -> imageStorageService.uploadPendingProductImage(storeId, file);
+            case "pending_variant" -> imageStorageService.uploadPendingVariantImage(storeId, file);
             case "runner" -> {
                 if (parentId == null) {
                     throw new IllegalArgumentException("parent_id is required for scope=runner");
@@ -50,7 +52,7 @@ public class ImageController {
                 yield imageStorageService.uploadRunnerProfilePicture(storeId, parentId, file);
             }
             default -> throw new IllegalArgumentException(
-                    "Unknown scope '" + scope + "'. Allowed: store_logo, product, variant, runner");
+                    "Unknown scope '" + scope + "'. Allowed: store_logo, product, variant, pending_product, pending_variant, runner");
         };
 
         ImageUploadResponse body = ImageUploadResponse.builder()
@@ -95,6 +97,22 @@ public class ImageController {
         return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(r, "variant", variantId));
     }
 
+    @PostMapping(value = "/pending-product", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<ImageUploadResponse> uploadPendingProductImage(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("store_id") UUID storeId) {
+        ImageStorageService.UploadResult r = imageStorageService.uploadPendingProductImage(storeId, file);
+        return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(r, "pending_product", storeId));
+    }
+
+    @PostMapping(value = "/pending-variant", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<ImageUploadResponse> uploadPendingVariantImage(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("store_id") UUID storeId) {
+        ImageStorageService.UploadResult r = imageStorageService.uploadPendingVariantImage(storeId, file);
+        return ResponseEntity.status(HttpStatus.CREATED).body(toResponse(r, "pending_variant", storeId));
+    }
+
     @DeleteMapping("/{keyPrefix}/{keyDate}/{keyName}")
     public ResponseEntity<Map<String, Object>> deleteImage(
             @PathVariable String keyPrefix,
@@ -123,7 +141,7 @@ public class ImageController {
         return ResponseEntity.ok(Map.of(
                 "max_upload_mb", 20,
                 "allowed_types", "image/jpeg,image/png,image/webp,image/gif,image/avif",
-                "supported_scopes", "store_logo,product,variant,runner"
+                "supported_scopes", "store_logo,product,variant,pending_product,pending_variant,runner"
         ));
     }
 

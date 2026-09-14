@@ -9,7 +9,9 @@ import lombok.NoArgsConstructor;
 import org.hibernate.annotations.Type;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -47,6 +49,11 @@ public class Product {
     @Column(name = "thumbnail_url", length = 1024)
     private String thumbnailUrl;
 
+    @Type(JsonType.class)
+    @Column(name = "gallery_image_urls", columnDefinition = "jsonb")
+    @Builder.Default
+    private List<String> galleryImageUrls = new ArrayList<>();
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
@@ -58,6 +65,9 @@ public class Product {
         }
         if (attributes == null) {
             attributes = new HashMap<>();
+        }
+        if (galleryImageUrls == null) {
+            galleryImageUrls = new ArrayList<>();
         }
     }
 }

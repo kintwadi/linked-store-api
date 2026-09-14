@@ -89,6 +89,20 @@ public class ImageStorageService {
         return uploadInternal(folder, file);
     }
 
+    public UploadResult uploadPendingProductImage(UUID storeId, MultipartFile file) {
+        assertR2Configured();
+        validateFile(file);
+        String folder = "stores/%s/uploads/pending/products".formatted(storeId);
+        return uploadInternal(folder, file);
+    }
+
+    public UploadResult uploadPendingVariantImage(UUID storeId, MultipartFile file) {
+        assertR2Configured();
+        validateFile(file);
+        String folder = "stores/%s/uploads/pending/variants".formatted(storeId);
+        return uploadInternal(folder, file);
+    }
+
     public UploadResult uploadRunnerProfilePicture(UUID storeId, UUID runnerId, MultipartFile file) {
         assertR2Configured();
         validateFile(file);

@@ -8,6 +8,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Repository
@@ -57,4 +58,6 @@ public interface ProductRepository extends JpaRepository<Product, UUID> {
             @Param("limit") int limit,
             @Param("offset") int offset
     );
+
+    Optional<Product> findByTitle(String title);
 }
