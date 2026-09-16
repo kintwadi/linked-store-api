@@ -34,12 +34,22 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
+        String token = null;
         String authHeader = request.getHeader(HttpHeaders.AUTHORIZATION);
-        if (authHeader == null || authHeader.isBlank() || !authHeader.startsWith(BEARER)) {
+        if (authHeader != null && !authHeader.isBlank() && authHeader.startsWith(BEARER)) {
+            token = authHeader.substring(BEARER.length()).trim();
+        }
+        if ((token == null || token.isBlank()) && "GET".equalsIgnoreCase(request.getMethod())) {
+            String uri = request.getRequestURI() == null ? "" : request.getRequestURI();
+            if (uri.endsWith("/sse/events") || uri.contains("/sse/events/")) {
+                String qp = request.getParameter("access_token");
+                if (qp != null && !qp.isBlank()) token = qp.trim();
+            }
+        }
+        if (token == null || token.isBlank()) {
             filterChain.doFilter(request, response);
             return;
         }
-        String token = authHeader.substring(BEARER.length()).trim();
         try {
             Claims claims = jwtService.parseAccess(token);
             CurrentUser current = buildCurrent(claims);

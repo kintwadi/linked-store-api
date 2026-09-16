@@ -7,13 +7,20 @@ import com.stripe.param.TransferCreateParams;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.PickupVerifyRequest;
 import com.vicinity24.core.linkedstore.api.dto.PickupVerifyResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
+import com.vicinity24.core.linkedstore.api.entity.InventoryLock;
+import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
 import com.vicinity24.core.linkedstore.api.entity.QrToken;
 import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
+import com.vicinity24.core.linkedstore.api.repository.InventoryLockRepository;
+import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,7 +29,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -32,10 +41,13 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class PickupController {
 
+    private final StripeConfig stripeConfig;
     private final QrTokenRepository qrTokenRepository;
     private final TransactionRepository transactionRepository;
     private final StoreRepository storeRepository;
-    private final StripeConfig stripeConfig;
+    private final InventoryLockRepository inventoryLockRepository;
+    private final ProductVariantRepository productVariantRepository;
+    private final TransactionEventBroadcaster eventBroadcaster;
 
     @PostMapping("/verify")
     @Transactional
@@ -100,9 +112,55 @@ public class PickupController {
                     .build());
         }
 
+        boolean justPickedUp = false;
         if (tx.getStatus() != TransactionStatus.PICKED_UP) {
             tx.setStatus(TransactionStatus.PICKED_UP);
             transactionRepository.save(tx);
+            justPickedUp = true;
+        }
+        if (justPickedUp) {
+            try {
+                UUID variantId = inventoryLockRepository.findByTransactionId(tx.getId()).stream()
+                        .findFirst().map(InventoryLock::getVariantId).orElse(null);
+                String productTitle = null;
+                String productImageUrl = null;
+                String sku = null;
+                BigDecimal retailPrice = null;
+                OffsetDateTime expiresAt = inventoryLockRepository.findByTransactionId(tx.getId()).stream()
+                        .findFirst().map(InventoryLock::getExpiresAt).orElse(null);
+                if (variantId != null) {
+                    Optional<ProductVariant> vOpt = productVariantRepository.findByIdWithProduct(variantId);
+                    if (vOpt.isPresent()) {
+                        ProductVariant v = vOpt.get();
+                        sku = v.getSku();
+                        if (v.getRetailPriceCents() != null) retailPrice = BigDecimal.valueOf(v.getRetailPriceCents()).scaleByPowerOfTen(-2);
+                        if (v.getProduct() != null) {
+                            productTitle = v.getProduct().getTitle();
+                            productImageUrl = v.getProduct().getPrimaryImageUrl();
+                        }
+                        if (productImageUrl == null) productImageUrl = v.getImageUrl();
+                    }
+                }
+                eventBroadcaster.broadcast(TxEvent.builder()
+                        .type(TxEventType.PICKED_UP)
+                        .createdAt(now)
+                        .transactionId(tx.getId())
+                        .storeId(tx.getFulfillingStoreId())
+                        .fulfillingStoreId(tx.getFulfillingStoreId())
+                        .originatingStoreId(tx.getOriginatingStoreId())
+                        .variantId(variantId)
+                        .productTitle(productTitle)
+                        .productImageUrl(productImageUrl)
+                        .sku(sku)
+                        .retailPrice(retailPrice)
+                        .currency("USD")
+                        .expiresAt(expiresAt)
+                        .status(tx.getStatus().name())
+                        .message("Customer picked up order from store.")
+                        .build());
+            } catch (Exception ex) {
+                log.warn("Pickup verify: broadcast PICKED_UP failed txId={}", tx.getId(), ex);
+            }
         }
 
         String transferId = null;

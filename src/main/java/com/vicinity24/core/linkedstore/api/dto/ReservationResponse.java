@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.time.OffsetDateTime;
 import java.util.UUID;
 
 @Data
@@ -20,6 +21,7 @@ public class ReservationResponse {
     private String productImageUrl;
     private String sku;
     private Integer countdownSeconds;
+    private OffsetDateTime expiresAt;
     private Integer totalRetailCents;
     private Integer wholesalePayoutCents;
     private Integer arbitrageMarginCents;

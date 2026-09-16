@@ -3,14 +3,19 @@ package com.vicinity24.core.linkedstore.api.controller;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vicinity24.core.linkedstore.api.dto.TransactionResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -26,6 +31,7 @@ public class TransactionController {
     private final TransactionItemRepository transactionItemRepository;
     private final ProductVariantRepository variantRepository;
     private final QrTokenRepository qrTokenRepository;
+    private final TransactionEventBroadcaster eventBroadcaster;
     private final ObjectMapper objectMapper;
 
     @GetMapping("/{id}")
@@ -48,13 +54,42 @@ public class TransactionController {
         try { id = UUID.fromString(idStr); } catch (IllegalArgumentException e) { return ResponseEntity.badRequest().build(); }
         Transaction tx = transactionRepository.findById(id).orElse(null);
         if (tx == null) return ResponseEntity.notFound().build();
-        if (tx.getStatus() == TransactionStatus.PAID || tx.getStatus() == TransactionStatus.PICKED_UP) {
-        } else {
+        boolean changed = false;
+        if (tx.getStatus() != TransactionStatus.PAID && tx.getStatus() != TransactionStatus.PICKED_UP) {
             tx.setStatus(TransactionStatus.PAID);
-            if (pi != null && !pi.isBlank()) tx.setStripePaymentIntentId(pi);
-            tx = transactionRepository.save(tx);
+            changed = true;
         }
-        return ResponseEntity.ok(buildTransactionResponse(tx));
+        if (pi != null && !pi.isBlank() && !pi.equals(tx.getStripePaymentIntentId())) {
+            tx.setStripePaymentIntentId(pi);
+            changed = true;
+        }
+        if (changed) tx = transactionRepository.save(tx);
+        TransactionResponse resp = buildTransactionResponse(tx);
+        if (changed) {
+            try {
+                BigDecimal price = resp.getTotalRetailCents() != null
+                        ? BigDecimal.valueOf(resp.getTotalRetailCents()).scaleByPowerOfTen(-2)
+                        : null;
+                eventBroadcaster.broadcast(TxEvent.builder()
+                        .type(TxEventType.PAID)
+                        .createdAt(OffsetDateTime.now())
+                        .transactionId(tx.getId())
+                        .storeId(tx.getFulfillingStoreId())
+                        .fulfillingStoreId(tx.getFulfillingStoreId())
+                        .originatingStoreId(tx.getOriginatingStoreId())
+                        .variantId(resp.getVariantId())
+                        .productId(resp.getProductId())
+                        .productTitle(resp.getProductTitle())
+                        .productImageUrl(resp.getProductImageUrl())
+                        .sku(resp.getSku())
+                        .retailPrice(price)
+                        .currency(resp.getCurrency() != null ? resp.getCurrency() : "USD")
+                        .status(tx.getStatus().name())
+                        .message("Customer completed payment. Ready for in-store pickup.")
+                        .build());
+            } catch (Exception ex) { log.warn("markPaid: broadcast PAID failed txId={}", tx.getId(), ex); }
+        }
+        return ResponseEntity.ok(resp);
     }
 
     private TransactionResponse buildTransactionResponse(Transaction tx) {

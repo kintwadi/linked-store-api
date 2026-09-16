@@ -4,9 +4,12 @@ import com.stripe.Stripe;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.ReservationRequest;
 import com.vicinity24.core.linkedstore.api.dto.ReservationResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.exception.ResourceNotFoundException;
 import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,6 +18,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -22,6 +27,7 @@ import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -39,6 +45,7 @@ public class ReservationController {
     private final StoreUserRepository storeUserRepository;
     private final QrTokenRepository qrTokenRepository;
     private final StripeConfig stripeConfig;
+    private final TransactionEventBroadcaster eventBroadcaster;
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
@@ -181,6 +188,35 @@ public class ReservationController {
                 ? product.getPrimaryImageUrl()
                 : variant.getImageUrl();
 
+        final OffsetDateTime pickupExpiresAt = lock.getExpiresAt();
+        try {
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.RESERVED)
+                    .createdAt(now)
+                    .transactionId(tx.getId())
+                    .storeId(variant.getStoreId())
+                    .fulfillingStoreId(variant.getStoreId())
+                    .originatingStoreId(originatingStoreId)
+                    .variantId(variant.getId())
+                    .productId(product.getId())
+                    .productTitle(product.getTitle())
+                    .productImageUrl(productImageUrl)
+                    .sku(variant.getSku())
+                    .retailPrice(BigDecimal.valueOf(totalRetailCents)
+                            .setScale(2, RoundingMode.UNNECESSARY)
+                            .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY))
+                    .currency("USD")
+                    .expiresAt(pickupExpiresAt)
+                    .countdownSeconds(countdownSeconds)
+                    .qrFallbackCode(fallbackCode)
+                    .runnerId(runnerId != null ? runnerId.toString() : null)
+                    .status("RESERVED")
+                    .message("Item reserved — 15-minute hold for customer pickup.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("Reservation: broadcast RESERVED event failed", ex);
+        }
+
         return ResponseEntity.status(HttpStatus.CREATED).body(ReservationResponse.builder()
                 .accepted(true)
                 .transactionId(tx.getId())
@@ -189,6 +225,7 @@ public class ReservationController {
                 .productImageUrl(productImageUrl)
                 .sku(variant.getSku())
                 .countdownSeconds(countdownSeconds)
+                .expiresAt(lock.getExpiresAt())
                 .totalRetailCents(totalRetailCents)
                 .wholesalePayoutCents(wholesalePayoutCents)
                 .arbitrageMarginCents(arbitrageMarginCents)
@@ -344,4 +381,76 @@ public class ReservationController {
             return null;
         }
     }
+
+    @PostMapping("/{txId}/cancel")
+    @Transactional
+    public ResponseEntity<?> cancelReservation(@PathVariable("txId") String txIdStr) {
+        UUID txId;
+        try { txId = UUID.fromString(txIdStr); } catch (IllegalArgumentException e) { return ResponseEntity.badRequest().build(); }
+        Transaction tx = transactionRepository.findById(txId).orElse(null);
+        if (tx == null) return ResponseEntity.notFound().build();
+        TransactionStatus s = tx.getStatus();
+        if (s == TransactionStatus.CANCELED || s == TransactionStatus.EXPIRED) {
+            return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+        }
+        if (s != TransactionStatus.RESERVED && s != TransactionStatus.PENDING_RESERVATION && s != TransactionStatus.READY) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "error", "Cannot cancel transaction in status " + s.name()));
+        }
+        tx.setStatus(TransactionStatus.CANCELED);
+        tx = transactionRepository.save(tx);
+        inventoryLockRepository.findByTransactionId(txId).forEach(lock -> {
+            if (lock.getStatus() != InventoryLockStatus.RELEASED_TO_STOCK
+                    && lock.getStatus() != InventoryLockStatus.RELEASED_TO_SALE
+                    && lock.getVariantId() != null) {
+                int qty = lock.getLockedQuantity() == null ? 1 : Math.max(1, lock.getLockedQuantity());
+                try { variantRepository.restoreStock(lock.getVariantId(), qty); }
+                catch (Exception ignore) {}
+                lock.setStatus(InventoryLockStatus.RELEASED_TO_STOCK);
+                inventoryLockRepository.save(lock);
+            }
+        });
+        try {
+            UUID variantId = inventoryLockRepository.findByTransactionId(txId).stream()
+                    .findFirst().map(InventoryLock::getVariantId).orElse(null);
+            String productTitle = null;
+            String productImageUrl = null;
+            String sku = null;
+            BigDecimal price = null;
+            OffsetDateTime expiresAt = inventoryLockRepository.findByTransactionId(txId).stream()
+                    .findFirst().map(InventoryLock::getExpiresAt).orElse(null);
+            if (variantId != null) {
+                Optional<ProductVariant> vOpt = variantRepository.findByIdWithProduct(variantId);
+                if (vOpt.isPresent()) {
+                    ProductVariant v = vOpt.get();
+                    sku = v.getSku();
+                    if (v.getRetailPriceCents() != null) price = BigDecimal.valueOf(v.getRetailPriceCents()).scaleByPowerOfTen(-2);
+                    if (v.getProduct() != null) {
+                        productTitle = v.getProduct().getTitle();
+                        productImageUrl = v.getProduct().getPrimaryImageUrl();
+                    }
+                    if (productImageUrl == null) productImageUrl = v.getImageUrl();
+                }
+            }
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.CANCELLED)
+                    .createdAt(OffsetDateTime.now())
+                    .transactionId(tx.getId())
+                    .storeId(tx.getFulfillingStoreId())
+                    .fulfillingStoreId(tx.getFulfillingStoreId())
+                    .originatingStoreId(tx.getOriginatingStoreId())
+                    .variantId(variantId)
+                    .productTitle(productTitle)
+                    .productImageUrl(productImageUrl)
+                    .sku(sku)
+                    .retailPrice(price)
+                    .currency("USD")
+                    .expiresAt(expiresAt)
+                    .status(tx.getStatus().name())
+                    .message("Customer cancelled the reservation.")
+                    .build());
+        } catch (Exception ex) { log.warn("cancelReservation broadcast CANCELLED failed txId={}", txId, ex); }
+        return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+    }
 }
+

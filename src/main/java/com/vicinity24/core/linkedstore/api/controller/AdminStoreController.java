@@ -13,11 +13,24 @@ import com.vicinity24.core.linkedstore.api.dto.StoreAdminResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingRequest;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreTransactionResponse;
+import com.vicinity24.core.linkedstore.api.dto.TransactionResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.dto.UpdateStoreRequest;
+import com.vicinity24.core.linkedstore.api.entity.InventoryLock;
+import com.vicinity24.core.linkedstore.api.entity.InventoryLockStatus;
 import com.vicinity24.core.linkedstore.api.entity.Product;
 import com.vicinity24.core.linkedstore.api.entity.ProductStatus;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
 import com.vicinity24.core.linkedstore.api.entity.Store;
+import com.vicinity24.core.linkedstore.api.entity.StoreUserRole;
+import com.vicinity24.core.linkedstore.api.entity.Transaction;
+import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
+import com.vicinity24.core.linkedstore.api.exception.ResourceNotFoundException;
+import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
+import com.vicinity24.core.linkedstore.api.security.CurrentUser;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import com.vicinity24.core.linkedstore.api.entity.SubscriptionStatus;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.VariantStatus;
@@ -40,10 +53,13 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Slf4j
@@ -58,8 +74,11 @@ public class AdminStoreController {
     private final TransactionItemRepository transactionItemRepository;
     private final ProductRepository productRepository;
     private final ProductVariantRepository productVariantRepository;
+    private final InventoryLockRepository inventoryLockRepository;
     private final AuthenticationFacade authenticationFacade;
     private final StripeConfig stripeConfig;
+    private final TransactionEventBroadcaster eventBroadcaster;
+    private final TransactionController transactionController;
 
     @Value("${linkedstore.connect.frontend-return-url:http://localhost:4200/admin}")
     private String defaultReturnUrl;
@@ -442,13 +461,22 @@ public class AdminStoreController {
                 String ownerEmail = (body != null && body.get("ownerEmail") != null)
                         ? body.get("ownerEmail")
                         : ("store-" + store.getId() + "@vicinity24.dev");
+                String reqCountry = body != null ? body.get("country") : null;
+                String reqCurrency = body != null ? body.get("defaultCurrency") : null;
+                final String country = ConnectController.resolveCountry(reqCountry);
+                final String currency = ConnectController.resolveCurrencyForCountry(reqCountry, reqCurrency);
+                final AccountCreateParams.BusinessType businessType = ConnectController.parseBusinessType(
+                        body != null ? body.get("businessType") : null);
                 AccountCreateParams.Builder b = AccountCreateParams.builder()
                         .setType(AccountCreateParams.Type.EXPRESS)
-                        .setCountry("US")
+                        .setCountry(country)
+                        .setDefaultCurrency(currency)
                         .setEmail(ownerEmail)
-                        .setBusinessType(AccountCreateParams.BusinessType.INDIVIDUAL)
+                        .setBusinessType(businessType)
                         .putMetadata("storeId", store.getId().toString())
                         .putMetadata("businessName", store.getBusinessName())
+                        .putMetadata("country", country)
+                        .putMetadata("defaultCurrency", currency)
                         .setCapabilities(AccountCreateParams.Capabilities.builder()
                                 .setTransfers(AccountCreateParams.Capabilities.Transfers.builder()
                                         .setRequested(true).build())
@@ -460,8 +488,8 @@ public class AdminStoreController {
                 store.setStripeConnectId(stripeConnectId);
                 storeRepository.save(store);
                 isNewAccount = true;
-                log.info("AdminConnect: created new Stripe Account {} for store {}",
-                        stripeConnectId, store.getId());
+                log.info("AdminConnect: created new Stripe Account {} for store {} ({}), country={}, currency={}",
+                        stripeConnectId, store.getId(), store.getBusinessName(), country, currency);
             }
             try {
                 Account current = Account.retrieve(stripeConnectId);
@@ -486,34 +514,43 @@ public class AdminStoreController {
                     ? body.get("returnUrl") : defaultReturnUrl;
             String refreshUrl = (body != null && body.get("refreshUrl") != null)
                     ? body.get("refreshUrl") : defaultRefreshUrl;
-            AccountLinkCreateParams linkParams = AccountLinkCreateParams.builder()
-                    .setAccount(stripeConnectId)
-                    .setRefreshUrl(refreshUrl)
-                    .setReturnUrl(returnUrl)
-                    .setType(AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING)
-                    .setCollect(AccountLinkCreateParams.Collect.CURRENTLY_DUE)
-                    .build();
-            try {
-                com.stripe.model.AccountLink link = com.stripe.model.AccountLink.create(linkParams);
-                return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                        .url(link.getUrl())
-                        .object("account_link")
-                        .status(isNewAccount ? "new_account" : "existing_account")
-                        .stripeConnectId(stripeConnectId)
-                        .storeId(store.getId())
-                        .build());
-            } catch (StripeException ex) {
-                String fallback = "https://dashboard.stripe.com/" + stripeConnectId;
-                log.warn("AdminConnect: AccountLink fallback {}", ex.getMessage());
-                return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                        .url(fallback)
-                        .object("account_link")
-                        .status(isNewAccount ? "new_account" : "existing_account")
-                        .stripeConnectId(stripeConnectId)
-                        .storeId(store.getId())
-                        .message("Fallback dashboard access: " + ex.getMessage())
-                        .build());
+
+            String url = ConnectController.tryCreateAccountLink(stripeConnectId,
+                    AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING,
+                    AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
+            String strategy = "account_onboarding_currently_due";
+            String object = "account_link";
+            if (url == null && !isNewAccount) {
+                url = ConnectController.tryCreateAccountLink(stripeConnectId,
+                        AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                        AccountLinkCreateParams.Collect.EVENTUALLY_DUE, refreshUrl, returnUrl);
+                strategy = "account_update_eventually_due";
             }
+            if (url == null && !isNewAccount) {
+                url = ConnectController.tryCreateAccountLink(stripeConnectId,
+                        AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                        AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
+                strategy = "account_update_currently_due";
+            }
+            if (url == null) {
+                url = ConnectController.tryCreateExpressLoginLink(stripeConnectId);
+                strategy = strategy + "|login_link_fallback";
+                object = "login_link";
+            }
+            if (url == null) {
+                url = "https://dashboard.stripe.com/express/" + stripeConnectId;
+                strategy = strategy + "|express_dashboard_manual";
+                object = "express_dashboard";
+                log.warn("AdminConnect: no AccountLink/LoginLink for {} → manual Express dashboard URL.", stripeConnectId);
+            }
+            return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
+                    .url(url)
+                    .object(object)
+                    .status(isNewAccount ? "new_account" : "existing_account")
+                    .stripeConnectId(stripeConnectId)
+                    .storeId(store.getId())
+                    .message(strategy)
+                    .build());
         } catch (StripeException ex) {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
                     .status("error")
@@ -535,10 +572,20 @@ public class AdminStoreController {
         }
         try {
             Account account = Account.retrieve(store.getStripeConnectId());
-            String dashboard = "https://dashboard.stripe.com/" + store.getStripeConnectId();
+            String url = ConnectController.tryCreateExpressLoginLink(store.getStripeConnectId());
+            String object = "login_link";
+            String message = "express_login_link";
+            if (url == null) {
+                url = "https://dashboard.stripe.com/express/" + store.getStripeConnectId();
+                object = "express_dashboard";
+                message = "login_link_not_available|express_dashboard_manual";
+                log.warn("AdminConnect: createLoginLink failed Express LoginLink, manual Express dashboard fallback for {}",
+                        store.getStripeConnectId());
+            }
             return ResponseEntity.ok(ConnectOnboardingResponse.builder()
-                    .url(dashboard)
-                    .object("login_link")
+                    .url(url)
+                    .object(object)
+                    .message(message)
                     .status("ok")
                     .stripeConnectId(store.getStripeConnectId())
                     .storeId(store.getId())
@@ -552,6 +599,185 @@ public class AdminStoreController {
                     .storeId(store.getId())
                     .build());
         }
+    }
+
+    // ---------- tx status transitions (broadcasts SSE events) ----------
+
+    /** Mark RESERVED → READY: store has item on shelf, waiting for customer within the 15-minute hold window. */
+    @PostMapping(value = "/{storeId}/transactions/{txId}/mark-ready")
+    @Transactional
+    public ResponseEntity<?> storeMarkReady(@PathVariable UUID storeId, @PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        authenticationFacade.requireStoreAdminOrOwner(storeId);
+        return doMarkReady(txId, storeId);
+    }
+
+    @PostMapping(value = "/me/transactions/{txId}/mark-ready")
+    @Transactional
+    public ResponseEntity<?> myStoreMarkReady(@PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        final Store store = resolveMyStore(cu);
+        return doMarkReady(txId, store.getId());
+    }
+
+    private ResponseEntity<?> doMarkReady(UUID txId, UUID storeId) {
+        Transaction tx = transactionRepository.findById(txId).orElse(null);
+        if (tx == null) return ResponseEntity.notFound().build();
+        if (!tx.getFulfillingStoreId().equals(storeId) && !tx.getOriginatingStoreId().equals(storeId)
+                && !authenticationFacade.current().isGlobalAdmin()) {
+            return ResponseEntity.status(403).build();
+        }
+        if (tx.getStatus() == TransactionStatus.READY
+                || tx.getStatus() == TransactionStatus.PAID
+                || tx.getStatus() == TransactionStatus.PICKED_UP) {
+            return ResponseEntity.ok(buildTxEventResponseOrEmpty(tx));
+        }
+        if (tx.getStatus() != TransactionStatus.RESERVED && tx.getStatus() != TransactionStatus.PENDING_RESERVATION) {
+            return ResponseEntity.status(409).body(Map.of("message",
+                    "Only RESERVED transactions can be marked ready. Current=" + tx.getStatus()));
+        }
+        tx.setStatus(TransactionStatus.READY);
+        tx = transactionRepository.save(tx);
+        final TransactionResponse txr = transactionController != null
+                ? transactionController.getTransaction(txId).getBody()
+                : null;
+        try {
+            eventBroadcaster.broadcast(buildTxEvent(TxEventType.READY, tx, txr, "Store confirmed item available for pickup."));
+        } catch (Exception ex) { log.warn("Admin: broadcast READY failed txId={}", txId, ex); }
+        return ResponseEntity.ok(buildTxEventResponseOrEmpty(tx));
+    }
+
+    /** Mark RESERVED / READY → CANCELED: item no longer available, release inventory lock, notify customer. */
+    @PostMapping(value = "/{storeId}/transactions/{txId}/mark-unavailable")
+    @Transactional
+    public ResponseEntity<?> storeMarkUnavailable(@PathVariable UUID storeId, @PathVariable UUID txId) {
+        authenticationFacade.requireStoreAdminOrOwner(storeId);
+        return doMarkUnavailable(txId, storeId, "Store marked item unavailable (out of stock during hold)");
+    }
+
+    @PostMapping(value = "/me/transactions/{txId}/mark-unavailable")
+    @Transactional
+    public ResponseEntity<?> myStoreMarkUnavailable(@PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        final Store store = resolveMyStore(cu);
+        return doMarkUnavailable(txId, store.getId(), "Store marked item unavailable");
+    }
+
+    private ResponseEntity<?> doMarkUnavailable(UUID txId, UUID storeId, String message) {
+        Transaction tx = transactionRepository.findById(txId).orElse(null);
+        if (tx == null) return ResponseEntity.notFound().build();
+        if (!tx.getFulfillingStoreId().equals(storeId) && !tx.getOriginatingStoreId().equals(storeId)
+                && !authenticationFacade.current().isGlobalAdmin()) {
+            return ResponseEntity.status(403).build();
+        }
+        if (tx.getStatus() == TransactionStatus.CANCELED || tx.getStatus() == TransactionStatus.EXPIRED) {
+            try { eventBroadcaster.broadcast(buildTxEvent(TxEventType.UNAVAILABLE, tx, null, message)); }
+            catch (Exception ignore) {}
+            return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+        }
+        if (tx.getStatus() == TransactionStatus.PICKED_UP || tx.getStatus() == TransactionStatus.PAID) {
+            return ResponseEntity.status(409).body(Map.of("message",
+                    "Cannot mark PAID/PICKED_UP transaction as unavailable."));
+        }
+        tx.setStatus(TransactionStatus.CANCELED);
+        tx = transactionRepository.save(tx);
+        releaseInventoryLock(tx.getId());
+        try {
+            eventBroadcaster.broadcast(buildTxEvent(TxEventType.UNAVAILABLE, tx, null, message));
+        } catch (Exception ex) { log.warn("Admin: broadcast UNAVAILABLE failed txId={}", txId, ex); }
+        return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+    }
+
+    private void releaseInventoryLock(UUID txId) {
+        inventoryLockRepository.findByTransactionId(txId).forEach(lock -> {
+            if (lock.getStatus() != InventoryLockStatus.RELEASED_TO_STOCK
+                    && lock.getStatus() != InventoryLockStatus.RELEASED_TO_SALE
+                    && lock.getVariantId() != null) {
+                int qty = lock.getLockedQuantity() == null ? 1 : Math.max(1, lock.getLockedQuantity());
+                try { productVariantRepository.restoreStock(lock.getVariantId(), qty); }
+                catch (Exception ignore) {}
+                lock.setStatus(InventoryLockStatus.RELEASED_TO_STOCK);
+                inventoryLockRepository.save(lock);
+            }
+        });
+    }
+
+    private TxEvent buildTxEvent(TxEventType type, Transaction tx, TransactionResponse txr, String message) {
+        UUID variantId = null;
+        UUID productId = null;
+        String productTitle = null;
+        String productImageUrl = null;
+        String sku = null;
+        OffsetDateTime expiresAt = null;
+        Integer countdown = null;
+        String fallbackCode = null;
+        String runnerId = null;
+        BigDecimal price = null;
+        String currency = "USD";
+        if (txr != null) {
+            variantId = txr.getVariantId();
+            productId = txr.getProductId();
+            productTitle = txr.getProductTitle();
+            productImageUrl = txr.getProductImageUrl();
+            sku = txr.getSku();
+            currency = txr.getCurrency();
+            if (txr.getTotalRetailCents() != null) {
+                price = BigDecimal.valueOf(txr.getTotalRetailCents()).scaleByPowerOfTen(-2);
+            }
+        } else {
+            List<InventoryLock> locks = inventoryLockRepository.findByTransactionId(tx.getId());
+            if (!locks.isEmpty()) {
+                InventoryLock l = locks.get(0);
+                variantId = l.getVariantId();
+                expiresAt = l.getExpiresAt();
+            }
+            if (variantId != null) {
+                Optional<ProductVariant> vOpt = productVariantRepository.findByIdWithProduct(variantId);
+                if (vOpt.isPresent()) {
+                    ProductVariant v = vOpt.get();
+                    sku = v.getSku();
+                    productId = v.getProductId();
+                    productImageUrl = v.getImageUrl();
+                    if (v.getProduct() != null) {
+                        productTitle = v.getProduct().getTitle();
+                        if (productImageUrl == null) productImageUrl = v.getProduct().getPrimaryImageUrl();
+                    }
+                    if (v.getRetailPriceCents() != null) {
+                        price = BigDecimal.valueOf(v.getRetailPriceCents()).scaleByPowerOfTen(-2);
+                    }
+                }
+            }
+        }
+        if (expiresAt == null) {
+            // no InventoryLock or txr: default 15 min offset from created
+            if (tx.getCreatedAt() != null) expiresAt = tx.getCreatedAt().plusMinutes(15);
+        }
+        return TxEvent.builder()
+                .type(type)
+                .createdAt(OffsetDateTime.now())
+                .transactionId(tx.getId())
+                .storeId(tx.getFulfillingStoreId())
+                .fulfillingStoreId(tx.getFulfillingStoreId())
+                .originatingStoreId(tx.getOriginatingStoreId())
+                .variantId(variantId)
+                .productId(productId)
+                .productTitle(productTitle)
+                .productImageUrl(productImageUrl)
+                .sku(sku)
+                .retailPrice(price)
+                .currency(currency == null ? "USD" : currency)
+                .expiresAt(expiresAt)
+                .status(tx.getStatus() != null ? tx.getStatus().name() : null)
+                .message(message)
+                .build();
+    }
+
+    private Map<String,Object> buildTxEventResponseOrEmpty(Transaction tx) {
+        Map<String,Object> out = new HashMap<>();
+        out.put("transactionId", tx.getId().toString());
+        out.put("status", tx.getStatus().name());
+        out.put("updatedAt", OffsetDateTime.now().toString());
+        return out;
     }
 
     private void ensureStripeKey() {

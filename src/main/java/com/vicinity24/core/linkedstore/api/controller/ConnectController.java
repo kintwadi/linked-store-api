@@ -29,6 +29,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -66,14 +67,21 @@ public class ConnectController {
         try {
             String stripeConnectId = store.getStripeConnectId();
             boolean isNewAccount = false;
+            String accountCountry = "US";
             if (stripeConnectId == null || stripeConnectId.isBlank() || stripeConnectId.startsWith("acct_connected_")) {
+                final String country = request.resolvedCountry();
+                final String currency = request.resolvedDefaultCurrency();
+                final AccountCreateParams.BusinessType businessType = parseBusinessType(request.getBusinessType());
                 final AccountCreateParams.Builder b = AccountCreateParams.builder()
                         .setType(AccountCreateParams.Type.EXPRESS)
-                        .setCountry("US")
+                        .setCountry(country)
+                        .setDefaultCurrency(currency)
                         .setEmail(request.getOwnerEmail() != null ? request.getOwnerEmail() : "store-" + store.getId() + "@vicinity24.dev")
-                        .setBusinessType(AccountCreateParams.BusinessType.INDIVIDUAL)
+                        .setBusinessType(businessType)
                         .putMetadata("storeId", store.getId().toString())
                         .putMetadata("businessName", store.getBusinessName())
+                        .putMetadata("country", country)
+                        .putMetadata("defaultCurrency", currency)
                         .setCapabilities(
                             AccountCreateParams.Capabilities.builder()
                                 .setTransfers(AccountCreateParams.Capabilities.Transfers.builder()
@@ -86,11 +94,17 @@ public class ConnectController {
 
                 final Account account = Account.create(b.build());
                 stripeConnectId = account.getId();
+                accountCountry = country;
                 store.setStripeConnectId(stripeConnectId);
                 storeRepository.save(store);
                 isNewAccount = true;
-                log.info("Connect: created new Stripe Account {} for store {} ({})",
-                        stripeConnectId, store.getId(), store.getBusinessName());
+                log.info("Connect: created new Stripe Account {} for store {} ({}), country={}, currency={}",
+                        stripeConnectId, store.getId(), store.getBusinessName(), country, currency);
+            } else {
+                try {
+                    Account existing = Account.retrieve(stripeConnectId);
+                    if (existing.getCountry() != null) accountCountry = existing.getCountry();
+                } catch (StripeException ignored) {}
             }
 
             try {
@@ -116,35 +130,50 @@ public class ConnectController {
                 log.warn("Connect: could not ensure capabilities: {}", capEx.getMessage());
             }
 
-            final AccountLinkCreateParams linkParams = AccountLinkCreateParams.builder()
-                    .setAccount(stripeConnectId)
-                    .setRefreshUrl(request.getRefreshUrl())
-                    .setReturnUrl(request.getReturnUrl())
-                    .setType(AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING)
-                    .setCollect(AccountLinkCreateParams.Collect.CURRENTLY_DUE)
-                    .build();
+            // --- Pick the right AccountLink strategy based on account state:
+            //   * Brand-new Express accounts with nothing submitted yet → ACCOUNT_ONBOARDING (onboards fields we generate with
+            //     CURRENTLY_DUE then fall back to ACCOUNT_UPDATE + EVENTUALLY_DUE then LoginLink
+            //   * Already-submitted Express accounts → ACCOUNT_UPDATE lets Stripe allows edits; if that fails then
+            //     create an Express Dashboard LoginLink (merchant-embeddable session) instead of platform-dashboard fallback)
+            final String refreshUrl = request.getRefreshUrl();
+            final String returnUrl = request.getReturnUrl();
+            String url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING,
+                    AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
+            String strategy = "account_onboarding_currently_due";
+            String linkObject = "account_link";
 
-            try {
-                final com.stripe.model.AccountLink link = com.stripe.model.AccountLink.create(linkParams);
-                return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                        .url(link.getUrl())
-                        .object("account_link")
-                        .status(isNewAccount ? "new_account" : "existing_account")
-                        .stripeConnectId(stripeConnectId)
-                        .storeId(store.getId())
-                        .build());
-            } catch (StripeException ex) {
-                String fallbackUrl = "https://dashboard.stripe.com/" + stripeConnectId;
-                log.warn("Connect: AccountLink.create failed for {}, falling back to dashboard URL: {}", stripeConnectId, ex.getMessage());
-                return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                        .url(fallbackUrl)
-                        .object("account_link")
-                        .status(isNewAccount ? "new_account" : "existing_account")
-                        .stripeConnectId(stripeConnectId)
-                        .storeId(store.getId())
-                        .message("Could not generate Express onboarding link (dashboard access provided): " + ex.getMessage())
-                        .build());
+            if (url == null && !isNewAccount) {
+                url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                        AccountLinkCreateParams.Collect.EVENTUALLY_DUE, refreshUrl, returnUrl);
+                strategy = "account_update_eventually_due";
             }
+            if (url == null && !isNewAccount) {
+                url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                        AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
+                strategy = "account_update_currently_due";
+            }
+            if (url == null) {
+                url = tryCreateExpressLoginLink(stripeConnectId);
+                strategy = strategy + "|login_link_fallback";
+                linkObject = "login_link";
+            }
+            if (url == null) {
+                // Last-ditch fallback: platform-level Stripe dashboard URL (least preferred because platform-login page)
+                url = "https://dashboard.stripe.com/express/" + stripeConnectId;
+                strategy = strategy + "|express_dashboard_manual";
+                linkObject = "express_dashboard";
+                log.warn("Connect: no AccountLink + LoginLink exhausted; falling back to manual Express dashboard URL for {}",
+                        stripeConnectId);
+            }
+
+            return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
+                    .url(url)
+                    .object(linkObject)
+                    .status(isNewAccount ? "new_account" : "existing_account")
+                    .stripeConnectId(stripeConnectId)
+                    .storeId(store.getId())
+                    .message(strategy)
+                    .build());
         } catch (StripeException ex) {
             log.error("Connect: failed onboarding-link for store {}", storeOpt.get().getId(), ex);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
@@ -174,11 +203,21 @@ public class ConnectController {
         }
         try {
             final Account account = Account.retrieve(store.getStripeConnectId());
-            final String dashboardUrl = "https://dashboard.stripe.com/" + store.getStripeConnectId();
+            String url = tryCreateExpressLoginLink(store.getStripeConnectId());
+            String object = "login_link";
+            String message = "express_login_link";
+            if (url == null) {
+                url = "https://dashboard.stripe.com/express/" + store.getStripeConnectId();
+                object = "express_dashboard";
+                message = "login_link_not_available|express_dashboard_manual";
+                log.warn("Connect: login-link endpoint falling back to manual Express dashboard URL for {}",
+                        store.getStripeConnectId());
+            }
             return ResponseEntity.ok(ConnectOnboardingResponse.builder()
-                    .url(dashboardUrl)
-                    .object("login_link")
+                    .url(url)
+                    .object(object)
                     .status("ok")
+                    .message(message)
                     .stripeConnectId(store.getStripeConnectId())
                     .storeId(store.getId())
                     .chargesEnabled(account.getChargesEnabled())
@@ -311,6 +350,67 @@ public class ConnectController {
     private void ensureStripeKey() {
         if (Stripe.apiKey == null || Stripe.apiKey.isBlank()) {
             Stripe.apiKey = stripeConfig.getStripeApiKey();
+        }
+    }
+
+    static AccountCreateParams.BusinessType parseBusinessType(String raw) {
+        if (raw == null || raw.isBlank()) return AccountCreateParams.BusinessType.INDIVIDUAL;
+        return switch (raw.trim().toUpperCase(Locale.ROOT).replace('-', '_').replace(' ', '_')) {
+            case "INDIVIDUAL", "SOLE_PROPRIETORSHIP", "SOLETRADER" -> AccountCreateParams.BusinessType.INDIVIDUAL;
+            case "COMPANY", "CORPORATION", "LLC", "LIMITED_LIABILITY_COMPANY", "PRIVATE_LIMITED", "PLC" -> AccountCreateParams.BusinessType.COMPANY;
+            case "NON_PROFIT", "NONPROFIT", "CHARITY" -> AccountCreateParams.BusinessType.NON_PROFIT;
+            case "GOVERNMENT_ENTITY", "GOVERNMENT" -> AccountCreateParams.BusinessType.GOVERNMENT_ENTITY;
+            default -> AccountCreateParams.BusinessType.INDIVIDUAL;
+        };
+    }
+
+    static String resolveCountry(String country) {
+        return ConnectOnboardingRequest.builder().country(country).build().resolvedCountry();
+    }
+
+    static String resolveCurrencyForCountry(String country, String explicitCurrency) {
+        return ConnectOnboardingRequest.builder()
+                .country(country)
+                .defaultCurrency(explicitCurrency)
+                .build()
+                .resolvedDefaultCurrency();
+    }
+
+    static String tryCreateAccountLink(
+            String stripeConnectId,
+            AccountLinkCreateParams.Type linkType,
+            AccountLinkCreateParams.Collect collect,
+            String refreshUrl,
+            String returnUrl) {
+        try {
+            AccountLinkCreateParams.Builder params = AccountLinkCreateParams.builder()
+                    .setAccount(stripeConnectId)
+                    .setType(linkType)
+                    .setCollect(collect);
+            if (refreshUrl != null && !refreshUrl.isBlank()) params.setRefreshUrl(refreshUrl);
+            if (returnUrl  != null && !returnUrl.isBlank())  params.setReturnUrl(returnUrl);
+            com.stripe.model.AccountLink link = com.stripe.model.AccountLink.create(params.build());
+            log.info("Connect: AccountLink OK type={} collect={} account={}", linkType.name(), collect.name(), stripeConnectId);
+            return link.getUrl();
+        } catch (StripeException ex) {
+            log.info("Connect: AccountLink skip type={} collect={} account={}: {} (code={})",
+                    linkType.name(), collect.name(), stripeConnectId,
+                    ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage(),
+                    ex.getCode());
+            return null;
+        }
+    }
+
+    static String tryCreateExpressLoginLink(String stripeConnectId) {
+        try {
+            Map<String, Object> params = Map.of();
+            // stripe-java uses account.loginLinks.create(params) via reflection-safe map-style API
+            com.stripe.model.LoginLink created = com.stripe.model.LoginLink.createOnAccount(stripeConnectId, params);
+            log.info("Connect: LoginLink OK account={}", stripeConnectId);
+            return created.getUrl();
+        } catch (StripeException | RuntimeException ex) {
+            log.info("Connect: LoginLink skip account={}: {}", stripeConnectId, ex.getMessage());
+            return null;
         }
     }
 
