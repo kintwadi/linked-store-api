@@ -45,6 +45,7 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.POST, "/api/reservations", "/api/checkout/**",
                         "/api/pickup/verify", "/api/transactions/*/mark-paid").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/connect/webhook").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/connect/health").permitAll()
                 .requestMatchers("/api/admin/stores/me", "/api/admin/stores/me/**").hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER")
                 .requestMatchers("/api/admin/stores/**").hasRole("GLOBAL_ADMIN")
                 .requestMatchers("/api/admin/transactions/**", "/api/admin/users/**")

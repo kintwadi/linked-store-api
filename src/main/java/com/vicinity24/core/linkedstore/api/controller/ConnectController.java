@@ -47,6 +47,52 @@ public class ConnectController {
     @Value("${stripe.connect.webhook-secret:}")
     private String connectWebhookSecret;
 
+    @GetMapping("/health")
+    public Map<String, Object> connectHealth() {
+        final Map<String, Object> out = new LinkedHashMap<>();
+        final String key = com.stripe.Stripe.apiKey;
+        if (key == null || key.isBlank()) {
+            out.put("keyMode", "UNKNOWN");
+            out.put("keyPrefixMasked", "(not set)");
+            out.put("connectActivated", false);
+            out.put("stripeErrorCode", "key_missing");
+            out.put("stripeErrorMessage", "Stripe.apiKey is not configured — backend STRIPE_SECRET_KEY env var is empty.");
+            return out;
+        }
+        final String mode;
+        if (key.toLowerCase(Locale.ROOT).startsWith("sk_test_")) mode = "TEST";
+        else if (key.toLowerCase(Locale.ROOT).startsWith("sk_live_")) mode = "LIVE";
+        else if (key.toLowerCase(Locale.ROOT).startsWith("pk_")) mode = "PK_ONLY_INVALID";
+        else mode = "UNKNOWN";
+        final String prefix = key.length() <= 16 ? key : key.substring(0, 16) + "xxxxxxxx";
+        out.put("keyMode", mode);
+        out.put("keyPrefixMasked", prefix);
+        try {
+            ensureStripeKey();
+            com.stripe.param.AccountListParams p = com.stripe.param.AccountListParams.builder().setLimit(1L).build();
+            com.stripe.model.AccountCollection list = com.stripe.model.Account.list(p);
+            out.put("connectActivated", true);
+            out.put("connectedAccountsCount", list.getData() != null ? list.getData().size() : 0);
+            out.put("stripeErrorCode", null);
+            out.put("stripeErrorMessage", null);
+        } catch (StripeException sx) {
+            StripeErrorInfo sei = StripeErrorInfo.from(sx);
+            out.put("connectActivated", false);
+            out.put("stripeErrorCode", sei.code());
+            out.put("stripeErrorMessage", sei.userMessage());
+            if (sei.code() != null && sei.code().toLowerCase(Locale.ROOT).contains("platform_account_required")) {
+                String activationUrl = "TEST".equalsIgnoreCase(mode)
+                        ? "https://dashboard.stripe.com/test/settings/connect"
+                        : "LIVE".equalsIgnoreCase(mode)
+                            ? "https://dashboard.stripe.com/settings/connect"
+                            : "https://dashboard.stripe.com/account/applications/settings";
+                out.put("stripeActivationUrl", activationUrl);
+                out.put("nextStep", "Open the URL above in Stripe dashboard (mode: " + mode + "), click 'Get started with Connect' → 'Platform or marketplace' → 'Managed / Express payouts'. Then restart backend.");
+            }
+        }
+        return out;
+    }
+
     @PostMapping("/onboarding-link")
     public ResponseEntity<ConnectOnboardingResponse> createOnboardingLink(
             @Valid @RequestBody ConnectOnboardingRequest request) {
