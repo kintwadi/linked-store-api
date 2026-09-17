@@ -23,6 +23,10 @@ public interface StoreRepository extends JpaRepository<Store, UUID> {
 
     List<Store> findAllBySubscriptionStatus(SubscriptionStatus subscriptionStatus);
 
+    boolean existsByGatewayCode(String gatewayCode);
+
+    Optional<Store> findByGatewayCode(String gatewayCode);
+
     void deleteByStripeConnectIdStartingWith(String prefix);
 
     @Query(value = """

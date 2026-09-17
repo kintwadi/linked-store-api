@@ -90,21 +90,30 @@ public class ProductCatalogSeeder {
         var storeDowntown = ensureStore("store-downtown-01",
                 "Kicks & Co. — Downtown Flagship",
                 new BigDecimal("40.712776"), new BigDecimal("-74.005974"),
+                "US", "USD",
                 "acct_1UFGaNGVibqsNijL",
                 "https://images.unsplash.com/photo-1556906781-9a412961c28c?auto=format&fit=crop&w=400&h=400&q=80",
-                "https://images.unsplash.com/photo-1514996937319-344454492b37?auto=format&fit=crop&w=1400&h=700&q=80");
+                "https://images.unsplash.com/photo-1514996937319-344454492b37?auto=format&fit=crop&w=1400&h=700&q=80",
+                "120 Broadway, Manhattan, New York, NY",
+                "10271");
         var storeUptown = ensureStore("store-uptown-02",
                 "Sole District — Uptown",
                 new BigDecimal("40.783060"), new BigDecimal("-73.971249"),
+                "US", "USD",
                 "acct_1UFHDaGbVVxOVEbj",
                 "https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=400&h=400&q=80",
-                "https://images.unsplash.com/photo-1595950653106-6c9ebd614d3a?auto=format&fit=crop&w=1400&h=700&q=80");
+                "https://images.unsplash.com/photo-1595950653106-6c9ebd614d3a?auto=format&fit=crop&w=1400&h=700&q=80",
+                "745 Fifth Ave, Manhattan, New York, NY",
+                "10150");
         var storeBrooklyn = ensureStore("store-brooklyn-03",
                 "Brooklyn Runs — Williamsburg",
                 new BigDecimal("40.708978"), new BigDecimal("-73.956555"),
+                "US", "USD",
                 "acct_1UFGaNGjyrXTQ6F6",
                 "https://images.unsplash.com/photo-1600185365483-26d7a4cc7519?auto=format&fit=crop&w=400&h=400&q=80",
-                "https://images.unsplash.com/photo-1556905055-8f358a7a47b2?auto=format&fit=crop&w=1400&h=700&q=80");
+                "https://images.unsplash.com/photo-1556905055-8f358a7a47b2?auto=format&fit=crop&w=1400&h=700&q=80",
+                "186 Bedford Ave, Brooklyn, NY",
+                "11249");
         log.info("CatalogSeeder: stores=[{}, {}, {}]", storeDowntown.getBusinessName(),
                 storeUptown.getBusinessName(), storeBrooklyn.getBusinessName());
 
@@ -214,6 +223,18 @@ public class ProductCatalogSeeder {
 
         storeRepository.deleteByStripeConnectIdStartingWith("acct_connected_");
 
+        int backfilled = 0;
+        for (Store s : storeRepository.findAll()) {
+            if (s.getGatewayCode() == null || s.getGatewayCode().isBlank()) {
+                s.setGatewayCode(generateUniqueGatewayCode(storeRepository));
+                storeRepository.save(s);
+                backfilled++;
+            }
+        }
+        if (backfilled > 0) {
+            log.info("CatalogSeeder: backfilled gateway_code on {} previously-created stores", backfilled);
+        }
+
         int totalVariants = (int) variantRepository.count();
         int totalProducts = (int) productRepository.count();
         int totalStores = (int) storeRepository.count();
@@ -222,18 +243,28 @@ public class ProductCatalogSeeder {
     }
 
     private Store ensureStore(String externalRef, String businessName, BigDecimal lat, BigDecimal lng,
-                              String stripeConnectId, String logoUrl, String heroImageUrl) {
+                              String countryCode, String currencyCode,
+                              String stripeConnectId, String logoUrl, String heroImageUrl,
+                              String address, String postalCode) {
+        String effectiveAddress = (address == null || address.isBlank()) ? "General Delivery" : address;
+        String effectivePostalCode = (postalCode == null || postalCode.isBlank()) ? "00000" : postalCode;
         List<Store> matches = storeRepository.findAllByBusinessName(businessName);
         Store chosen;
         if (matches.isEmpty()) {
+            String code = generateUniqueGatewayCode(storeRepository);
             chosen = storeRepository.save(Store.builder()
                     .businessName(businessName)
                     .latitude(lat)
                     .longitude(lng)
+                    .countryCode(countryCode)
+                    .currencyCode(currencyCode)
                     .stripeConnectId(stripeConnectId)
                     .subscriptionStatus(SubscriptionStatus.ACTIVE)
                     .logoUrl(logoUrl)
                     .heroImageUrl(heroImageUrl)
+                    .address(effectiveAddress)
+                    .postalCode(effectivePostalCode)
+                    .gatewayCode(code)
                     .build());
         } else {
             chosen = matches.stream()
@@ -251,11 +282,23 @@ public class ProductCatalogSeeder {
             boolean dirty = false;
             if (chosen.getLatitude().compareTo(lat) != 0) { chosen.setLatitude(lat); dirty = true; }
             if (chosen.getLongitude().compareTo(lng) != 0) { chosen.setLongitude(lng); dirty = true; }
+            if ((chosen.getCountryCode() == null || chosen.getCountryCode().isBlank()) && countryCode != null) {
+                chosen.setCountryCode(countryCode); dirty = true;
+            }
+            if ((chosen.getCurrencyCode() == null || chosen.getCurrencyCode().isBlank()) && currencyCode != null) {
+                chosen.setCurrencyCode(currencyCode); dirty = true;
+            }
             if ((chosen.getLogoUrl() == null || chosen.getLogoUrl().isBlank()) && logoUrl != null) {
                 chosen.setLogoUrl(logoUrl); dirty = true;
             }
             if ((chosen.getHeroImageUrl() == null || chosen.getHeroImageUrl().isBlank()) && heroImageUrl != null) {
                 chosen.setHeroImageUrl(heroImageUrl); dirty = true;
+            }
+            if ((chosen.getAddress() == null || chosen.getAddress().isBlank()) && effectiveAddress != null) {
+                chosen.setAddress(effectiveAddress); dirty = true;
+            }
+            if ((chosen.getPostalCode() == null || chosen.getPostalCode().isBlank()) && effectivePostalCode != null) {
+                chosen.setPostalCode(effectivePostalCode); dirty = true;
             }
             if (chosen.getSubscriptionStatus() == null) {
                 chosen.setSubscriptionStatus(SubscriptionStatus.ACTIVE); dirty = true;
@@ -265,9 +308,23 @@ public class ProductCatalogSeeder {
                         || chosen.getStripeConnectId().startsWith("acct_connected_"))) {
                 chosen.setStripeConnectId(stripeConnectId); dirty = true;
             }
+            if (chosen.getGatewayCode() == null || chosen.getGatewayCode().isBlank()) {
+                chosen.setGatewayCode(generateUniqueGatewayCode(storeRepository));
+                dirty = true;
+            }
             if (dirty) chosen = storeRepository.save(chosen);
         }
         return chosen;
+    }
+
+    private static String generateUniqueGatewayCode(StoreRepository storeRepository) {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            String candidate = Store.generateGatewayCode();
+            if (!storeRepository.existsByGatewayCode(candidate)) {
+                return candidate;
+            }
+        }
+        return String.format("%014d", System.nanoTime() % 100000000000000L);
     }
 
     private Product ensureProduct(String skuStem, String title, String description,

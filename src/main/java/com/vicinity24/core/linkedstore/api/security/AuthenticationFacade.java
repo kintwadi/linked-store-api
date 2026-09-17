@@ -1,6 +1,8 @@
 package com.vicinity24.core.linkedstore.api.security;
 
 import com.vicinity24.core.linkedstore.api.entity.UserRole;
+import com.vicinity24.core.linkedstore.api.security.permission.PermissionService;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
@@ -9,6 +11,13 @@ import java.util.UUID;
 
 @Component
 public class AuthenticationFacade {
+
+    private PermissionService permissionService;
+
+    @Autowired
+    public void setPermissionService(PermissionService permissionService) {
+        this.permissionService = permissionService;
+    }
 
     public CurrentUser current() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
@@ -27,41 +36,31 @@ public class AuthenticationFacade {
         return u.getStoreId();
     }
 
-    public void requireGlobalAdmin() {
-        if (!current().isGlobalAdmin()) {
-            throw new SecurityException("Global admin privileges are required.");
-        }
-    }
-
-    public void requireStoreAdminOrOwner(UUID targetStoreId) {
-        CurrentUser u = current();
-        if (!u.isAtLeastStoreAdmin()) {
-            throw new SecurityException("Store admin or owner privileges are required.");
-        }
-        if (!u.isGlobalAdmin() && targetStoreId != null
-                && (u.getStoreId() == null || !u.getStoreId().equals(targetStoreId))) {
-            throw new SecurityException("You may not manage another store.");
-        }
-    }
-
-    public void requireAtLeastRole(UserRole minimum) {
-        CurrentUser u = current();
-        if (!u.isAuthenticated()) throw new SecurityException("Authentication required.");
-        if (u.isGlobalAdmin()) return;
-        if (rank(u.getRole()) < rank(minimum)) {
-            throw new SecurityException("Insufficient role.");
-        }
-    }
-
-    private static int rank(UserRole r) {
+    public static int roleRankOf(UserRole r) {
         if (r == null) return 0;
         return switch (r) {
             case GLOBAL_ADMIN -> 100;
-            case OWNER -> 50;
+            case OWNER -> 80;
             case STORE_ADMIN -> 45;
-            case CLERK -> 20;
-            case RUNNER -> 10;
+            case STORE_REPRESENTATIVE -> 25;
+            case CLERK -> 10;
+            case RUNNER -> 5;
         };
+    }
+
+    @Deprecated(since = "permissions-module", forRemoval = false)
+    public void requireGlobalAdmin() {
+        permissionService.ensureGlobalAdmin(current());
+    }
+
+    @Deprecated(since = "permissions-module", forRemoval = false)
+    public void requireStoreAdminOrOwner(UUID targetStoreId) {
+        permissionService.ensureCanEditStoreSettings(current(), targetStoreId);
+    }
+
+    @Deprecated(since = "permissions-module", forRemoval = false)
+    public void requireAtLeastRole(UserRole minimum) {
+        permissionService.ensureAtLeastRole(current(), minimum);
     }
 
     private static CurrentUser anonymous() {

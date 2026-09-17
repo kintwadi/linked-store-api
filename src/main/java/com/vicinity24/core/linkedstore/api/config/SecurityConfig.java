@@ -39,6 +39,7 @@ public class SecurityConfig {
             .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
             .authorizeHttpRequests(auth -> auth
+                .requestMatchers(HttpMethod.GET, "/api/auth/invites/*/preview").permitAll()
                 .requestMatchers("/api/auth/**").permitAll()
                 .requestMatchers("/api/public/**").permitAll()
                 .requestMatchers(HttpMethod.GET, "/api/stores", "/api/products", "/api/products/**").permitAll()
@@ -46,13 +47,36 @@ public class SecurityConfig {
                         "/api/pickup/verify", "/api/transactions/*/mark-paid").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/connect/webhook").permitAll()
                 .requestMatchers(HttpMethod.GET, "/api/connect/health").permitAll()
-                .requestMatchers("/api/admin/stores/me", "/api/admin/stores/me/**").hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER")
+                .requestMatchers("/sse/**", "/sse/*/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
+                .requestMatchers("/api/admin/stores/me", "/api/admin/stores/me/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers(HttpMethod.GET, "/api/admin/stores/*").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers(HttpMethod.GET, "/api/admin/stores/*/inventory",
+                        "/api/admin/stores/*/inventory/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
+                .requestMatchers(HttpMethod.POST, "/api/admin/stores/*/inventory/*/share-code").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
+                .requestMatchers(HttpMethod.POST, "/api/admin/stores/*/inventory",
+                        "/api/admin/stores/*/inventory/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers(HttpMethod.PUT, "/api/admin/stores/*/inventory/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers(HttpMethod.DELETE, "/api/admin/stores/*/inventory/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers(HttpMethod.POST, "/api/admin/stores/*/connect/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/admin/stores/*/connect/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
                 .requestMatchers("/api/admin/stores/**").hasRole("GLOBAL_ADMIN")
-                .requestMatchers("/api/admin/transactions/**", "/api/admin/users/**")
-                    .hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER")
-                .requestMatchers("/api/connect/**").hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER")
+                .requestMatchers("/api/admin/transactions/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                .requestMatchers("/api/admin/users/**").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
+                .requestMatchers("/api/connect/**").hasAnyRole("GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
                 .requestMatchers("/api/fulfillment/**", "/api/inventory/**")
-                    .hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER", "CLERK", "RUNNER")
+                    .hasAnyRole("GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/actuator/**").denyAll()
                 .anyRequest().permitAll()
             );

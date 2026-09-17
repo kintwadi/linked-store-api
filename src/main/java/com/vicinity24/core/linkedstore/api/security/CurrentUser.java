@@ -26,7 +26,8 @@ public class CurrentUser {
         if (targetStoreId == null) return false;
         if (storeId == null) return false;
         return storeId.equals(targetStoreId)
-                && (role == UserRole.STORE_ADMIN || role == UserRole.OWNER);
+                && (role == UserRole.STORE_ADMIN || role == UserRole.OWNER
+                    || role == UserRole.STORE_REPRESENTATIVE);
     }
 
     public boolean isAtLeastStoreAdmin() {

@@ -105,3 +105,10 @@ linkedstore:
     issuer: ${LINKEDSTORE_AUTH_ISSUER:linked-store}
     default-admin-email: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_EMAIL:admin@linked.store}
     default-admin-password: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_PASSWORD:Admin123!}
+    api-base-origin: ${API_BASE_ORIGIN:http://localhost:4200}
+  geocoding:
+    locationiq:
+      api-key: ${LOCATION_IQ_API_KEY:}
+      base-url: ${LOCATION_IQ_BASE_URL:https://us1.locationiq.com}
+      countrycodes: ${LOCATION_IQ_COUNTRYCODES:pt,de,fr,be}
+      timeout-ms: ${LOCATION_IQ_TIMEOUT_MS:8000}

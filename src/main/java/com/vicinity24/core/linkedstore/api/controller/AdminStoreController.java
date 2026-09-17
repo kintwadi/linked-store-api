@@ -8,12 +8,14 @@ import com.stripe.param.AccountLinkCreateParams;
 import com.stripe.param.AccountUpdateParams;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.ConnectOnboardingResponse;
+import com.vicinity24.core.linkedstore.api.dto.CreateStoreInviteRequest;
 import com.vicinity24.core.linkedstore.api.dto.CreateStoreRequest;
 import com.vicinity24.core.linkedstore.api.dto.LinkAttempt;
 import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
 import com.vicinity24.core.linkedstore.api.dto.StoreAdminResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingRequest;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingResponse;
+import com.vicinity24.core.linkedstore.api.dto.StoreInviteResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreTransactionResponse;
 import com.vicinity24.core.linkedstore.api.dto.StripeErrorInfo;
 import com.vicinity24.core.linkedstore.api.dto.TransactionResponse;
@@ -26,10 +28,14 @@ import com.vicinity24.core.linkedstore.api.entity.Product;
 import com.vicinity24.core.linkedstore.api.entity.ProductStatus;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
 import com.vicinity24.core.linkedstore.api.entity.Store;
+import com.vicinity24.core.linkedstore.api.entity.StoreInvite;
 import com.vicinity24.core.linkedstore.api.entity.StoreUserRole;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
+import com.vicinity24.core.linkedstore.api.entity.UserRole;
 import com.vicinity24.core.linkedstore.api.exception.ResourceNotFoundException;
+import com.vicinity24.core.linkedstore.api.geocoding.GeocodeResult;
+import com.vicinity24.core.linkedstore.api.geocoding.GeocodingService;
 import com.vicinity24.core.linkedstore.api.repository.*;
 import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
 import com.vicinity24.core.linkedstore.api.security.CurrentUser;
@@ -46,19 +52,23 @@ import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.repository.UserAccountRepository;
 import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
 import com.vicinity24.core.linkedstore.api.security.CurrentUser;
+import com.vicinity24.core.linkedstore.api.security.permission.PermissionService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
+import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -78,16 +88,24 @@ public class AdminStoreController {
     private final ProductRepository productRepository;
     private final ProductVariantRepository productVariantRepository;
     private final InventoryLockRepository inventoryLockRepository;
+    private final StoreInviteRepository storeInviteRepository;
+    private final PermissionService permissionService;
     private final AuthenticationFacade authenticationFacade;
     private final StripeConfig stripeConfig;
     private final TransactionEventBroadcaster eventBroadcaster;
     private final TransactionController transactionController;
+    private final GeocodingService geocodingService;
+
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     @Value("${linkedstore.connect.frontend-return-url:http://localhost:4200/admin}")
     private String defaultReturnUrl;
 
     @Value("${linkedstore.connect.frontend-refresh-url:http://localhost:4200/admin}")
     private String defaultRefreshUrl;
+
+    @Value("${linkedstore.auth.api-base-origin:http://localhost:4200}")
+    private String apiBaseOrigin;
 
     // ---------- "me" endpoints (for STORE_ADMIN / OWNER / GLOBAL_ADMIN scoped to store) ----------
 
@@ -104,6 +122,7 @@ public class AdminStoreController {
         CurrentUser current = authenticationFacade.current();
         Store store = resolveMyStore(current);
         applyStoreUpdate(store, request);
+        maybeGeocodeUpdatedCoords(store, request, String.valueOf(store.getId()));
         store = storeRepository.save(store);
         log.info("Store admin updated own store id={}", store.getId());
         return ResponseEntity.ok(buildStoreAdminResponse(store));
@@ -123,6 +142,60 @@ public class AdminStoreController {
         CurrentUser current = authenticationFacade.current();
         Store store = resolveMyStore(current);
         return createLoginLink(store);
+    }
+
+    @PostMapping("/me/invites")
+    @Transactional
+    public ResponseEntity<StoreInviteResponse> createInvite(
+            @Valid @RequestBody CreateStoreInviteRequest request,
+            HttpServletRequest httpRequest) {
+        CurrentUser current = authenticationFacade.current();
+        Store store = resolveMyStore(current);
+
+        UserRole targetRole;
+        try {
+            targetRole = UserRole.valueOf(request.getRole());
+        } catch (IllegalArgumentException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid role: " + request.getRole());
+        }
+
+        permissionService.ensureCanInviteRole(current, store.getId(), targetRole);
+
+        int ttlDays = request.getTtlDays() != null ? request.getTtlDays() : 7;
+        if (ttlDays < 1) {
+            ttlDays = 7;
+        }
+
+        byte[] randomBytes = new byte[48];
+        SECURE_RANDOM.nextBytes(randomBytes);
+        String tokenPart = Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes);
+        String inviteToken = "inv_" + tokenPart;
+
+        OffsetDateTime now = OffsetDateTime.now();
+        OffsetDateTime expiresAt = now.plusDays(ttlDays);
+
+        StoreInvite invite = StoreInvite.builder()
+                .storeId(store.getId())
+                .inviteToken(inviteToken)
+                .targetRole(targetRole)
+                .prefillEmail(request.getPrefillEmail())
+                .createdBy(current.getUserId())
+                .createdAt(now)
+                .expiresAt(expiresAt)
+                .status(StoreInvite.STATUS_PENDING)
+                .build();
+        invite = storeInviteRepository.save(invite);
+
+        String redeemUrl = buildRedeemUrl(httpRequest, inviteToken);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(StoreInviteResponse.builder()
+                .inviteToken(invite.getInviteToken())
+                .redeemUrl(redeemUrl)
+                .expiresAt(invite.getExpiresAt())
+                .targetRole(invite.getTargetRole() != null ? invite.getTargetRole().name() : null)
+                .prefillEmail(invite.getPrefillEmail())
+                .status(invite.getStatus())
+                .build());
     }
 
     // ---------- "me" inventory endpoints ----------
@@ -199,7 +272,6 @@ public class AdminStoreController {
     // ---------- Global-admin CRUD ----------
 
     @GetMapping("")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<?> listStores() {
         authenticationFacade.requireGlobalAdmin();
         List<Store> stores = storeRepository.findAll();
@@ -211,16 +283,15 @@ public class AdminStoreController {
     }
 
     @GetMapping("/{id}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<?> getStore(@PathVariable("id") UUID id) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureViewStore(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         return ResponseEntity.ok(buildStoreAdminResponse(store));
     }
 
     @PostMapping("")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> createStore(@Valid @RequestBody CreateStoreRequest request) {
         authenticationFacade.requireGlobalAdmin();
@@ -229,14 +300,40 @@ public class AdminStoreController {
             try { subStatus = SubscriptionStatus.valueOf(request.getSubscriptionStatus()); }
             catch (IllegalArgumentException ignored) { subStatus = SubscriptionStatus.ACTIVE; }
         }
+
+        BigDecimal lat = request.getLatitude();
+        BigDecimal lng = request.getLongitude();
+        boolean latMissing = lat == null || BigDecimal.ZERO.compareTo(lat) == 0;
+        boolean lngMissing = lng == null || BigDecimal.ZERO.compareTo(lng) == 0;
+        boolean hasAddress = org.springframework.util.StringUtils.hasText(request.getAddress())
+                || org.springframework.util.StringUtils.hasText(request.getPostalCode());
+        if ((latMissing || lngMissing) && hasAddress) {
+            GeocodeResult geo = geocodingService.resolveStoreLocation(
+                    request.getAddress(), request.getPostalCode(), request.getCountryCode());
+            if (geo.success()) {
+                lat = geo.latitude();
+                lng = geo.longitude();
+                log.info("AdminStoreController: Geocoded new store '{}' to ({},{}) from address/postal (matched='{}')",
+                        request.getBusinessName(), lat, lng, geo.matchedAddress());
+            } else {
+                log.info("AdminStoreController: New store '{}' coordinates not geocoded ({}); using provided lat={} lng={}",
+                        request.getBusinessName(), geo.errorMessage(), request.getLatitude(), request.getLongitude());
+            }
+        }
+
         Store store = Store.builder()
                 .businessName(request.getBusinessName())
-                .latitude(request.getLatitude())
-                .longitude(request.getLongitude())
+                .latitude(lat)
+                .longitude(lng)
+                .countryCode(request.getCountryCode())
+                .currencyCode(request.getCurrencyCode())
                 .stripeConnectId(request.getStripeConnectId())
                 .subscriptionStatus(subStatus)
                 .logoUrl(request.getLogoUrl())
                 .heroImageUrl(request.getHeroImageUrl())
+                .address(request.getAddress())
+                .postalCode(request.getPostalCode())
+                .gatewayCode(generateUniqueGatewayCode(storeRepository))
                 .build();
         store = storeRepository.save(store);
         log.info("Global admin created store id={} businessName={}",
@@ -246,27 +343,28 @@ public class AdminStoreController {
     }
 
     @PutMapping("/{id}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> updateStore(
             @PathVariable("id") UUID id,
             @Valid @RequestBody UpdateStoreRequest request) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanEditStoreSettings(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         applyStoreUpdate(store, request);
+        maybeGeocodeUpdatedCoords(store, request, String.valueOf(id));
         store = storeRepository.save(store);
         log.info("Global admin updated store id={}", id);
         return ResponseEntity.ok(buildStoreAdminResponse(store));
     }
 
     @PutMapping("/{id}/subscription-status")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> updateSubscriptionStatus(
             @PathVariable("id") UUID id,
             @RequestBody Map<String, Object> body) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanEditStoreSettings(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         Object val = body.get("subscriptionStatus");
@@ -285,7 +383,6 @@ public class AdminStoreController {
     }
 
     @DeleteMapping("/{id}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> deleteStore(@PathVariable("id") UUID id) {
         authenticationFacade.requireGlobalAdmin();
@@ -301,9 +398,9 @@ public class AdminStoreController {
     // ---------- Global admin: Inventory per store by id ----------
 
     @GetMapping("/{id}/inventory")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<?> getStoreInventory(@PathVariable("id") UUID id) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureViewProductsOfStore(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         List<ProductVariant> variants = productVariantRepository.findByStoreId(store.getId());
@@ -316,12 +413,12 @@ public class AdminStoreController {
     }
 
     @PostMapping("/{id}/inventory")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> createStoreInventory(
             @PathVariable("id") UUID id,
             @RequestBody StoreInventoryListingRequest request) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCreateProduct(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         ProductVariant variant = createInventoryListing(store.getId(), request);
@@ -330,11 +427,11 @@ public class AdminStoreController {
     }
 
     @GetMapping("/{id}/inventory/{variantId}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<?> getStoreInventoryVariant(
             @PathVariable("id") UUID id,
             @PathVariable("variantId") UUID variantId) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureViewProductsOfStore(c, id);
         storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         ProductVariant variant = productVariantRepository.findByIdAndStoreId(variantId, id)
@@ -343,13 +440,13 @@ public class AdminStoreController {
     }
 
     @PutMapping("/{id}/inventory/{variantId}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> updateStoreInventoryVariant(
             @PathVariable("id") UUID id,
             @PathVariable("variantId") UUID variantId,
             @RequestBody StoreInventoryListingRequest request) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureEditProduct(c, id);
         storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         ProductVariant variant = productVariantRepository.findByIdAndStoreId(variantId, id)
@@ -361,12 +458,12 @@ public class AdminStoreController {
     }
 
     @DeleteMapping("/{id}/inventory/{variantId}")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<?> deleteStoreInventoryVariant(
             @PathVariable("id") UUID id,
             @PathVariable("variantId") UUID variantId) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureDeleteProduct(c, id);
         storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         ProductVariant variant = productVariantRepository.findByIdAndStoreId(variantId, id)
@@ -377,12 +474,40 @@ public class AdminStoreController {
         return ResponseEntity.ok(buildInventoryResponse(variant));
     }
 
+    @PostMapping("/{id}/inventory/{variantId}/share-code")
+    @Transactional
+    public ResponseEntity<Map<String, Object>> generateInventoryShareCode(
+            @PathVariable("id") UUID id,
+            @PathVariable("variantId") UUID variantId) {
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureGenerateQrForProduct(c, id);
+        storeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
+        ProductVariant variant = productVariantRepository.findByIdAndStoreId(variantId, id)
+                .orElseThrow(() -> new ResourceNotFoundException("ProductVariant", variantId.toString()));
+
+        byte[] tokenBytes = new byte[18];
+        SECURE_RANDOM.nextBytes(tokenBytes);
+        String shareCode = "qr_" + Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+        String shareUrl = apiBaseOrigin + "/p/" + variant.getProductId() + "/qr?variant=" + variant.getId() + "&share=" + shareCode;
+
+        Map<String, Object> resp = new HashMap<>();
+        resp.put("shareCode", shareCode);
+        resp.put("shareUrl", shareUrl);
+        resp.put("variantId", variant.getId());
+        resp.put("productId", variant.getProductId());
+        resp.put("storeId", id);
+        resp.put("generatedAt", OffsetDateTime.now().toString());
+        log.info("Share code generated variantId={} storeId={} by userId={}", variantId, id, c.getUserId());
+        return ResponseEntity.ok(resp);
+    }
+
     // ---------- Global admin: Transactions per store by id ----------
 
     @GetMapping("/{id}/transactions")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<?> getStoreTransactions(@PathVariable("id") UUID id) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanViewTransactions(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         return ResponseEntity.ok(buildStoreTransactionResponses(store.getId()));
@@ -391,21 +516,21 @@ public class AdminStoreController {
     // ---------- Global admin: Connect per store by id ----------
 
     @PostMapping("/{id}/connect/onboarding-link")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     @Transactional
     public ResponseEntity<ConnectOnboardingResponse> globalOnboardingLink(
             @PathVariable("id") UUID id,
             @RequestBody(required = false) Map<String, String> body) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanManagePayouts(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         return createOnboardingLink(store, body);
     }
 
     @PostMapping("/{id}/connect/login-link")
-    @PreAuthorize("hasRole('GLOBAL_ADMIN')")
     public ResponseEntity<ConnectOnboardingResponse> globalLoginLink(@PathVariable("id") UUID id) {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanManagePayouts(c, id);
         Store store = storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
         return createLoginLink(store);
@@ -422,9 +547,43 @@ public class AdminStoreController {
         if (storeId == null) {
             throw new ResourceNotFoundException("Store", "<not bound>");
         }
-        authenticationFacade.requireStoreAdminOrOwner(storeId);
+        permissionService.ensureViewStore(current, storeId);
         return storeRepository.findById(storeId)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", storeId.toString()));
+    }
+
+    static String generateUniqueGatewayCode(StoreRepository storeRepository) {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            String candidate = Store.generateGatewayCode();
+            if (!storeRepository.existsByGatewayCode(candidate)) {
+                return candidate;
+            }
+        }
+        return String.format("%014d", System.nanoTime() % 100000000000000L);
+    }
+
+    private void maybeGeocodeUpdatedCoords(Store store, UpdateStoreRequest request, String logStoreRef) {
+        BigDecimal currentLat = store.getLatitude();
+        BigDecimal currentLng = store.getLongitude();
+        boolean latMissing = currentLat == null || BigDecimal.ZERO.compareTo(currentLat) == 0;
+        boolean lngMissing = currentLng == null || BigDecimal.ZERO.compareTo(currentLng) == 0;
+        boolean addressProvided = org.springframework.util.StringUtils.hasText(request.getAddress())
+                || org.springframework.util.StringUtils.hasText(request.getPostalCode());
+        if ((latMissing || lngMissing) && addressProvided) {
+            GeocodeResult geo = geocodingService.resolveStoreLocation(
+                    request.getAddress() != null ? request.getAddress() : store.getAddress(),
+                    request.getPostalCode() != null ? request.getPostalCode() : store.getPostalCode(),
+                    store.getCountryCode());
+            if (geo.success()) {
+                store.setLatitude(geo.latitude());
+                store.setLongitude(geo.longitude());
+                log.info("AdminStoreController: Geocoded updated store {} to ({},{}) from address/postal (matched='{}')",
+                        logStoreRef, geo.latitude(), geo.longitude(), geo.matchedAddress());
+            } else {
+                log.info("AdminStoreController: Store {} coordinates not geocoded on update ({})",
+                        logStoreRef, geo.errorMessage());
+            }
+        }
     }
 
     private void applyStoreUpdate(Store store, UpdateStoreRequest request) {
@@ -436,6 +595,12 @@ public class AdminStoreController {
         }
         if (request.getLongitude() != null) {
             store.setLongitude(request.getLongitude());
+        }
+        if (request.getCountryCode() != null) {
+            store.setCountryCode(request.getCountryCode());
+        }
+        if (request.getCurrencyCode() != null) {
+            store.setCurrencyCode(request.getCurrencyCode());
         }
         if (request.getStripeConnectId() != null) {
             store.setStripeConnectId(request.getStripeConnectId());
@@ -452,6 +617,12 @@ public class AdminStoreController {
         }
         if (request.getHeroImageUrl() != null) {
             store.setHeroImageUrl(request.getHeroImageUrl());
+        }
+        if (request.getAddress() != null) {
+            store.setAddress(request.getAddress());
+        }
+        if (request.getPostalCode() != null) {
+            store.setPostalCode(request.getPostalCode());
         }
     }
 
@@ -836,6 +1007,8 @@ public class AdminStoreController {
                 .businessName(store.getBusinessName())
                 .latitude(store.getLatitude())
                 .longitude(store.getLongitude())
+                .countryCode(store.getCountryCode())
+                .currencyCode(store.getCurrencyCode())
                 .stripeConnectId(store.getStripeConnectId())
                 .onboarded(onboarded)
                 .subscriptionStatus(store.getSubscriptionStatus() != null
@@ -843,6 +1016,9 @@ public class AdminStoreController {
                         : null)
                 .logoUrl(store.getLogoUrl())
                 .heroImageUrl(store.getHeroImageUrl())
+                .address(store.getAddress())
+                .postalCode(store.getPostalCode())
+                .gatewayCode(store.getGatewayCode())
                 .activeSubscriptionId(store.getActiveSubscription() != null
                         ? store.getActiveSubscription().getId()
                         : null)
@@ -1035,5 +1211,22 @@ public class AdminStoreController {
                     .build());
         }
         return result;
+    }
+
+    private String buildRedeemUrl(HttpServletRequest request, String inviteToken) {
+        String origin = request.getHeader("Origin");
+        String base;
+        if (origin != null && !origin.isBlank()) {
+            base = origin;
+        } else {
+            String proto = request.getHeader("X-Forwarded-Proto");
+            String host = request.getHeader("Host");
+            if (proto != null && !proto.isBlank() && host != null && !host.isBlank()) {
+                base = proto + "://" + host;
+            } else {
+                base = apiBaseOrigin;
+            }
+        }
+        return base + "/signup?invite=" + inviteToken;
     }
 }

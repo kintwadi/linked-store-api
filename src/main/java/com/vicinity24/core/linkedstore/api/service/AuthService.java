@@ -5,6 +5,8 @@ import com.vicinity24.core.linkedstore.api.dto.RegisterStoreRequest;
 import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.UserAccount;
 import com.vicinity24.core.linkedstore.api.entity.UserRole;
+import com.vicinity24.core.linkedstore.api.geocoding.GeocodeResult;
+import com.vicinity24.core.linkedstore.api.geocoding.GeocodingService;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.UserAccountRepository;
 import io.jsonwebtoken.Claims;
@@ -22,6 +24,12 @@ import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.UUID;
 
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.util.StringUtils;
+
+import java.math.BigDecimal;
+
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class AuthService {
@@ -30,7 +38,18 @@ public class AuthService {
     private final StoreRepository storeRepository;
     private final PasswordService passwordService;
     private final JwtService jwtService;
+    private final GeocodingService geocodingService;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    static String generateUniqueGatewayCode(StoreRepository storeRepository) {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            String candidate = Store.generateGatewayCode();
+            if (!storeRepository.existsByGatewayCode(candidate)) {
+                return candidate;
+            }
+        }
+        return String.format("%014d", System.nanoTime() % 100000000000000L);
+    }
 
     @Transactional
     public UserAccount registerStoreAndUser(RegisterStoreRequest request) {
@@ -40,13 +59,37 @@ public class AuthService {
 
         String stripeConnectId = "acct_connected_new_" + generateRandomSuffix();
 
+        BigDecimal lat = request.getLatitude();
+        BigDecimal lng = request.getLongitude();
+        boolean latMissing = lat == null || BigDecimal.ZERO.compareTo(lat) == 0;
+        boolean lngMissing = lng == null || BigDecimal.ZERO.compareTo(lng) == 0;
+        boolean hasAddress = StringUtils.hasText(request.getAddress()) || StringUtils.hasText(request.getPostalCode());
+        if ((latMissing || lngMissing) && hasAddress) {
+            GeocodeResult geo = geocodingService.resolveStoreLocation(
+                    request.getAddress(), request.getPostalCode(), request.getCountryCode());
+            if (geo.success()) {
+                lat = geo.latitude();
+                lng = geo.longitude();
+                log.info("AuthService: Geocoded signup store '{}' to ({},{}) from address/postal (matched='{}')",
+                        request.getBusinessName(), lat, lng, geo.matchedAddress());
+            } else {
+                log.info("AuthService: Signup store '{}' coordinates not geocoded ({}); using provided lat={} lng={}",
+                        request.getBusinessName(), geo.errorMessage(), request.getLatitude(), request.getLongitude());
+            }
+        }
+
         Store store = Store.builder()
                 .businessName(request.getBusinessName())
-                .latitude(request.getLatitude())
-                .longitude(request.getLongitude())
+                .latitude(lat)
+                .longitude(lng)
+                .countryCode(request.getCountryCode())
+                .currencyCode(request.getCurrencyCode())
                 .stripeConnectId(stripeConnectId)
                 .logoUrl(request.getLogoUrl())
                 .heroImageUrl(request.getHeroImageUrl())
+                .address(request.getAddress())
+                .postalCode(request.getPostalCode())
+                .gatewayCode(generateUniqueGatewayCode(storeRepository))
                 .build();
         Store savedStore = storeRepository.save(store);
 

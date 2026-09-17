@@ -20,10 +20,15 @@ public class StoreAdminResponse {
     private String businessName;
     private BigDecimal latitude;
     private BigDecimal longitude;
+    private String countryCode;
+    private String currencyCode;
     private String stripeConnectId;
     private Boolean onboarded;
     private String logoUrl;
     private String heroImageUrl;
+    private String address;
+    private String postalCode;
+    private String gatewayCode;
     private String subscriptionStatus;
     private UUID activeSubscriptionId;
     private OffsetDateTime createdAt;
@@ -39,10 +44,15 @@ public class StoreAdminResponse {
                 .businessName(store.getBusinessName())
                 .latitude(store.getLatitude())
                 .longitude(store.getLongitude())
+                .countryCode(store.getCountryCode())
+                .currencyCode(store.getCurrencyCode())
                 .stripeConnectId(store.getStripeConnectId())
                 .onboarded(onboarded)
                 .logoUrl(store.getLogoUrl())
                 .heroImageUrl(store.getHeroImageUrl())
+                .address(store.getAddress())
+                .postalCode(store.getPostalCode())
+                .gatewayCode(store.getGatewayCode())
                 .subscriptionStatus(store.getSubscriptionStatus() != null ? store.getSubscriptionStatus().name() : null)
                 .activeSubscriptionId(store.getActiveSubscription() != null ? store.getActiveSubscription().getId() : null)
                 .createdAt(store.getCreatedAt())

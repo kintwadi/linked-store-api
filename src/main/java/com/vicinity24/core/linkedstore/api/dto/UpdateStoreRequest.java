@@ -16,8 +16,12 @@ public class UpdateStoreRequest {
     private String businessName;
     private BigDecimal latitude;
     private BigDecimal longitude;
+    private String countryCode;
+    private String currencyCode;
     private String logoUrl;
     private String heroImageUrl;
+    private String address;
+    private String postalCode;
     private String subscriptionStatus;
     private String stripeConnectId;
 }

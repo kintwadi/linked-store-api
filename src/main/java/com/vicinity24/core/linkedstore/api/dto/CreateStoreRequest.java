@@ -26,9 +26,16 @@ public class CreateStoreRequest {
     @NotNull(message = "longitude is required")
     private BigDecimal longitude;
 
+    private String countryCode;
+    private String currencyCode;
+
     private String logoUrl;
 
     private String heroImageUrl;
+
+    private String address;
+
+    private String postalCode;
 
     private String stripeConnectId;
     private String subscriptionStatus;

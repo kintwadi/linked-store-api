@@ -1,6 +1,7 @@
 package com.vicinity24.core.linkedstore.api.exception;
 
 import com.vicinity24.core.linkedstore.api.dto.ApiErrorResponse;
+import com.vicinity24.core.linkedstore.api.security.permission.PermissionDeniedException;
 import jakarta.persistence.OptimisticLockException;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -9,6 +10,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.authorization.AuthorizationDeniedException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -28,6 +30,33 @@ import java.util.stream.Collectors;
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    @ExceptionHandler(PermissionDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handlePermissionDenied(
+            PermissionDeniedException ex, HttpServletRequest request) {
+        log.warn("Permission denied: action={} target={} code={} path={}",
+                ex.getAction(), ex.getTargetId(), ex.getCode(), request.getRequestURI());
+        Map<String, Object> body = new HashMap<>();
+        body.put("status", "error");
+        body.put("message", ex.getMessage());
+        body.put("errorCode", "PERMISSION_" + ex.getCode());
+        body.put("target", ex.getTargetId() != null ? ex.getTargetId().toString() : null);
+        body.put("action", ex.getAction());
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body);
+    }
+
+    @ExceptionHandler(AuthorizationDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAuthorizationDenied(
+            AuthorizationDeniedException ex, HttpServletRequest request) {
+        log.warn("Authorization denied: path={} reason={}", request.getRequestURI(), ex.getMessage());
+        Map<String, Object> body = new HashMap<>();
+        body.put("status", "error");
+        body.put("message", ex.getMessage() != null ? ex.getMessage() : "Access denied");
+        body.put("errorCode", "PERMISSION_AUTHZ_DENIED");
+        body.put("target", null);
+        body.put("action", request.getMethod());
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(body);
+    }
 
     @ExceptionHandler(ReservationExpiredException.class)
     public ResponseEntity<ApiErrorResponse> handleReservationExpired(
