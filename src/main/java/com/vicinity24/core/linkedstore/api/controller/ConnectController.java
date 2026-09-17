@@ -10,9 +10,13 @@ import com.stripe.net.Webhook;
 import com.stripe.param.AccountCreateParams;
 import com.stripe.param.AccountLinkCreateParams;
 import com.stripe.param.AccountUpdateParams;
+import com.stripe.param.LoginLinkCreateOnAccountParams;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.ConnectOnboardingRequest;
 import com.vicinity24.core.linkedstore.api.dto.ConnectOnboardingResponse;
+import com.vicinity24.core.linkedstore.api.dto.LinkAttempt;
+import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
+import com.vicinity24.core.linkedstore.api.dto.StripeErrorInfo;
 import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
@@ -28,11 +32,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 
 @Slf4j
 @RestController
@@ -130,55 +130,54 @@ public class ConnectController {
                 log.warn("Connect: could not ensure capabilities: {}", capEx.getMessage());
             }
 
-            // --- Pick the right AccountLink strategy based on account state:
-            //   * Brand-new Express accounts with nothing submitted yet → ACCOUNT_ONBOARDING (onboards fields we generate with
-            //     CURRENTLY_DUE then fall back to ACCOUNT_UPDATE + EVENTUALLY_DUE then LoginLink
-            //   * Already-submitted Express accounts → ACCOUNT_UPDATE lets Stripe allows edits; if that fails then
-            //     create an Express Dashboard LoginLink (merchant-embeddable session) instead of platform-dashboard fallback)
             final String refreshUrl = request.getRefreshUrl();
             final String returnUrl = request.getReturnUrl();
-            String url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING,
-                    AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
-            String strategy = "account_onboarding_currently_due";
-            String linkObject = "account_link";
+            ResolvedLink resolved = resolveOnboardingOrDashboardLink(
+                    stripeConnectId, isNewAccount, refreshUrl, returnUrl);
 
-            if (url == null && !isNewAccount) {
-                url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
-                        AccountLinkCreateParams.Collect.EVENTUALLY_DUE, refreshUrl, returnUrl);
-                strategy = "account_update_eventually_due";
-            }
-            if (url == null && !isNewAccount) {
-                url = tryCreateAccountLink(stripeConnectId, AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
-                        AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
-                strategy = "account_update_currently_due";
-            }
-            if (url == null) {
-                url = tryCreateExpressLoginLink(stripeConnectId);
-                strategy = strategy + "|login_link_fallback";
-                linkObject = "login_link";
-            }
-            if (url == null) {
-                // Last-ditch fallback: platform-level Stripe dashboard URL (least preferred because platform-login page)
-                url = "https://dashboard.stripe.com/express/" + stripeConnectId;
-                strategy = strategy + "|express_dashboard_manual";
-                linkObject = "express_dashboard";
-                log.warn("Connect: no AccountLink + LoginLink exhausted; falling back to manual Express dashboard URL for {}",
-                        stripeConnectId);
+            if (resolved.url() == null) {
+                String message = "Stripe could not create an onboarding session. Try again in a moment, or "
+                        + "ensure the Connect account is not restricted.";
+                if (resolved.lastError() != null) {
+                    StringBuilder sb = new StringBuilder();
+                    if (resolved.lastError().userMessage() != null
+                            && !resolved.lastError().userMessage().isBlank()) {
+                        sb.append(resolved.lastError().userMessage());
+                    }
+                    if (resolved.lastError().code() != null && !resolved.lastError().code().isBlank()) {
+                        if (!sb.isEmpty()) sb.append(" ");
+                        sb.append("(Stripe code: ").append(resolved.lastError().code()).append(")");
+                    }
+                    if (resolved.lastError().declineCode() != null && !resolved.lastError().declineCode().isBlank()) {
+                        if (!sb.isEmpty()) sb.append(" ");
+                        sb.append("(decline: ").append(resolved.lastError().declineCode()).append(")");
+                    }
+                    if (!sb.isEmpty()) message = sb.toString();
+                }
+                log.warn("Connect: onboarding-link exhausted for account={} (store={}) strategies={}",
+                        stripeConnectId, store.getId(), resolved.strategiesTried());
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
+                        .status("error")
+                        .message(message)
+                        .storeId(store.getId())
+                        .stripeConnectId(stripeConnectId)
+                        .build());
             }
 
             return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                    .url(url)
-                    .object(linkObject)
+                    .url(resolved.url())
+                    .object(resolved.object())
                     .status(isNewAccount ? "new_account" : "existing_account")
                     .stripeConnectId(stripeConnectId)
                     .storeId(store.getId())
-                    .message(strategy)
+                    .message(resolved.strategiesTried())
                     .build());
         } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
             log.error("Connect: failed onboarding-link for store {}", storeOpt.get().getId(), ex);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
                     .status("error")
-                    .message(ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage())
+                    .message(sei.userMessage() != null ? sei.userMessage() : ex.getMessage())
                     .storeId(request.getStoreId())
                     .build());
         }
@@ -203,15 +202,39 @@ public class ConnectController {
         }
         try {
             final Account account = Account.retrieve(store.getStripeConnectId());
-            String url = tryCreateExpressLoginLink(store.getStripeConnectId());
+            LinkAttempt loginAttempt = tryCreateExpressLoginLink(store.getStripeConnectId());
+            String url = loginAttempt.url();
             String object = "login_link";
             String message = "express_login_link";
             if (url == null) {
-                url = "https://dashboard.stripe.com/express/" + store.getStripeConnectId();
-                object = "express_dashboard";
-                message = "login_link_not_available|express_dashboard_manual";
-                log.warn("Connect: login-link endpoint falling back to manual Express dashboard URL for {}",
-                        store.getStripeConnectId());
+                // DO NOT craft a fake https://dashboard.stripe.com/express/{acct_xxx} URL — that path does not exist on Stripe's side
+                // and navigating the user there just lands them on a 404.
+                StringBuilder sb = new StringBuilder();
+                sb.append("Stripe Express dashboard session could not be created. "
+                        + "This usually means onboarding details have not been fully submitted yet. "
+                        + "Click 'Connect Stripe' once to finish onboarding first, then retry opening the dashboard.");
+                if (loginAttempt.error() != null) {
+                    if (loginAttempt.error().userMessage() != null && !loginAttempt.error().userMessage().isBlank()) {
+                        sb.setLength(0);
+                        sb.append(loginAttempt.error().userMessage());
+                    }
+                    if (loginAttempt.error().code() != null && !loginAttempt.error().code().isBlank()) {
+                        sb.append(" (Stripe code: ").append(loginAttempt.error().code()).append(")");
+                    }
+                    if (loginAttempt.error().declineCode() != null && !loginAttempt.error().declineCode().isBlank()) {
+                        sb.append(" (decline: ").append(loginAttempt.error().declineCode()).append(")");
+                    }
+                }
+                log.warn("Connect: login-link endpoint could not generate LoginLink for store {}, account {}",
+                        store.getId(), store.getStripeConnectId());
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
+                        .status("error")
+                        .message(sb.toString())
+                        .storeId(store.getId())
+                        .stripeConnectId(store.getStripeConnectId())
+                        .chargesEnabled(account.getChargesEnabled())
+                        .payoutsEnabled(account.getPayoutsEnabled())
+                        .build());
             }
             return ResponseEntity.ok(ConnectOnboardingResponse.builder()
                     .url(url)
@@ -224,10 +247,11 @@ public class ConnectController {
                     .payoutsEnabled(account.getPayoutsEnabled())
                     .build());
         } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
             log.error("Connect: failed login-link for store {}", store.getId(), ex);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
                     .status("error")
-                    .message(ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage())
+                    .message(sei.userMessage() != null ? sei.userMessage() : ex.getMessage())
                     .storeId(store.getId())
                     .build());
         }
@@ -376,12 +400,13 @@ public class ConnectController {
                 .resolvedDefaultCurrency();
     }
 
-    static String tryCreateAccountLink(
+    static LinkAttempt tryCreateAccountLink(
             String stripeConnectId,
             AccountLinkCreateParams.Type linkType,
             AccountLinkCreateParams.Collect collect,
             String refreshUrl,
             String returnUrl) {
+        final String strategy = linkType.name().toLowerCase() + "_" + collect.name().toLowerCase();
         try {
             AccountLinkCreateParams.Builder params = AccountLinkCreateParams.builder()
                     .setAccount(stripeConnectId)
@@ -390,28 +415,170 @@ public class ConnectController {
             if (refreshUrl != null && !refreshUrl.isBlank()) params.setRefreshUrl(refreshUrl);
             if (returnUrl  != null && !returnUrl.isBlank())  params.setReturnUrl(returnUrl);
             com.stripe.model.AccountLink link = com.stripe.model.AccountLink.create(params.build());
-            log.info("Connect: AccountLink OK type={} collect={} account={}", linkType.name(), collect.name(), stripeConnectId);
-            return link.getUrl();
+            log.info("Connect: AccountLink OK strategy={} account={}", strategy, stripeConnectId);
+            return new LinkAttempt(link.getUrl(), strategy, null);
         } catch (StripeException ex) {
-            log.info("Connect: AccountLink skip type={} collect={} account={}: {} (code={})",
-                    linkType.name(), collect.name(), stripeConnectId,
-                    ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage(),
-                    ex.getCode());
-            return null;
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
+            log.info("Connect: AccountLink SKIP strategy={} account={}: {} (code={})",
+                    strategy, stripeConnectId,
+                    sei.userMessage() != null ? sei.userMessage() : ex.getMessage(),
+                    sei.code());
+            return new LinkAttempt(null, strategy, sei);
         }
     }
 
-    static String tryCreateExpressLoginLink(String stripeConnectId) {
+    static LinkAttempt tryCreateExpressLoginLink(String stripeConnectId) {
         try {
-            Map<String, Object> params = Map.of();
-            // stripe-java uses account.loginLinks.create(params) via reflection-safe map-style API
+            try {
+                Account current = Account.retrieve(stripeConnectId);
+                boolean needUpdate = false;
+                AccountUpdateParams.Builder upd = AccountUpdateParams.builder();
+                if (current.getCapabilities() == null
+                        || current.getCapabilities().getTransfers() == null
+                        || current.getCapabilities().getCardPayments() == null) {
+                    upd.setCapabilities(AccountUpdateParams.Capabilities.builder()
+                            .setTransfers(AccountUpdateParams.Capabilities.Transfers.builder()
+                                    .setRequested(true).build())
+                            .setCardPayments(AccountUpdateParams.Capabilities.CardPayments.builder()
+                                    .setRequested(true).build())
+                            .build());
+                    needUpdate = true;
+                }
+                if (needUpdate) {
+                    current.update(upd.build());
+                    log.info("Connect: LoginLink ensured transfers+card_payments requested on {}", stripeConnectId);
+                }
+            } catch (StripeException preEx) {
+                StripeErrorInfo sei = StripeErrorInfo.from(preEx);
+                log.warn("Connect: LoginLink pre-check failed for account {}: {} (code={})",
+                        stripeConnectId,
+                        sei.userMessage() != null ? sei.userMessage() : preEx.getMessage(),
+                        sei.code());
+            }
+
+            LoginLinkCreateOnAccountParams params = LoginLinkCreateOnAccountParams.builder().build();
             com.stripe.model.LoginLink created = com.stripe.model.LoginLink.createOnAccount(stripeConnectId, params);
             log.info("Connect: LoginLink OK account={}", stripeConnectId);
-            return created.getUrl();
+            return new LinkAttempt(created.getUrl(), "login_link", null);
         } catch (StripeException | RuntimeException ex) {
-            log.info("Connect: LoginLink skip account={}: {}", stripeConnectId, ex.getMessage());
-            return null;
+            String msg = ex.getMessage();
+            StripeErrorInfo sei = null;
+            if (ex instanceof StripeException sxp) {
+                sei = StripeErrorInfo.from(sxp);
+                if (sei.userMessage() != null && !sei.userMessage().isBlank()) msg = sei.userMessage();
+            }
+            log.warn("Connect: LoginLink FAILED account={} code={} declineCode={}: {}",
+                    stripeConnectId,
+                    sei != null ? sei.code() : null,
+                    sei != null ? sei.declineCode() : null,
+                    msg, ex);
+            return new LinkAttempt(null, "login_link", sei);
         }
+    }
+
+    /**
+     * Centralized onboarding/dashboard URL resolver. Runs the strategy chain based on actual Stripe account
+     * state (fetched live), and returns either a working URL or a ResolvedLink.lastError containing the most
+     * useful StripeErrorInfo (user-facing message + code) we saw.
+     *
+     * Strategy ordering:
+     *   1. BRAND-NEW accounts (isNewAccount OR details_submitted==false) → ACCOUNT_ONBOARDING + CURRENTLY_DUE.
+     *      Stripe rejects ACCOUNT_ONBOARDING when details_submitted=true, so NEVER try it for re-onboard.
+     *   2. ALREADY-SUBMITTED accounts (re-onboard click) → ACCOUNT_UPDATE, first EVENTUALLY_DUE then CURRENTLY_DUE.
+     *   3. If steps 1-2 produced no URL (either account has 0 pending requirements, OR onboarding + all update
+     *      variants rejected) → EXPRESS LOGIN LINK. This gives the merchant a live Express Dashboard session
+     *      where they can edit business details, payouts, see transactions, etc. — this is the correct flow
+     *      for "re-onboard" on an account that is fully onboarded and has nothing due.
+     */
+    static ResolvedLink resolveOnboardingOrDashboardLink(
+            String stripeConnectId,
+            boolean isNewAccount,
+            String refreshUrl,
+            String returnUrl) {
+        Account account;
+        try {
+            account = Account.retrieve(stripeConnectId);
+        } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
+            log.warn("Connect: resolveOnboarding: Account.retrieve({}) failed: {} (code={})",
+                    stripeConnectId,
+                    sei.userMessage() != null ? sei.userMessage() : ex.getMessage(),
+                    sei.code());
+            return ResolvedLink.empty("account_retrieve", sei);
+        }
+
+        Boolean detailsSubmitted = account.getDetailsSubmitted();
+        boolean submitted = detailsSubmitted != null && detailsSubmitted;
+        List<String> currentlyDue = account.getRequirements() != null && account.getRequirements().getCurrentlyDue() != null
+                ? account.getRequirements().getCurrentlyDue() : List.of();
+        List<String> eventuallyDue = account.getRequirements() != null && account.getRequirements().getEventuallyDue() != null
+                ? account.getRequirements().getEventuallyDue() : List.of();
+        boolean hasPending = !currentlyDue.isEmpty() || !eventuallyDue.isEmpty();
+
+        log.info("Connect: resolveOnboarding account={} detailsSubmitted={} "
+                        + "currentlyDue({})={}, eventuallyDue({})={}, isNewAccount={}",
+                stripeConnectId, submitted,
+                currentlyDue.size(), currentlyDue,
+                eventuallyDue.size(), eventuallyDue,
+                isNewAccount);
+
+        StringBuilder strategies = new StringBuilder();
+        StripeErrorInfo lastError = null;
+
+        // Step 1: INITIAL ONBOARDING — only when details not yet submitted.
+        if (!submitted) {
+            LinkAttempt at = tryCreateAccountLink(
+                    stripeConnectId,
+                    AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING,
+                    AccountLinkCreateParams.Collect.CURRENTLY_DUE,
+                    refreshUrl, returnUrl);
+            strategies.append(at.strategyName());
+            if (at.url() != null) return new ResolvedLink(at.url(), "account_link", strategies.toString(), null);
+            if (at.error() != null) lastError = at.error();
+        } else {
+            strategies.append("skip_account_onboarding(details_submitted=true)");
+        }
+
+        // Step 2: ACCOUNT_UPDATE variants (editing details/payouts on an already-submitted account).
+        // Order: EVENTUALLY_DUE first (looser — works even if no CURRENTLY_DUE pending items), then CURRENTLY_DUE.
+        // BUT: if the account has NO pending requirements at all, Stripe rejects BOTH with a 400. In that case
+        // we skip straight to the LoginLink (step 3) without wasting attempts or polluting lastError.
+        if (submitted && hasPending) {
+            strategies.append("|");
+            LinkAttempt at1 = tryCreateAccountLink(
+                    stripeConnectId,
+                    AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                    AccountLinkCreateParams.Collect.EVENTUALLY_DUE,
+                    refreshUrl, returnUrl);
+            strategies.append(at1.strategyName());
+            if (at1.url() != null) return new ResolvedLink(at1.url(), "account_link", strategies.toString(), null);
+            if (at1.error() != null) lastError = at1.error();
+
+            strategies.append("|");
+            LinkAttempt at2 = tryCreateAccountLink(
+                    stripeConnectId,
+                    AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
+                    AccountLinkCreateParams.Collect.CURRENTLY_DUE,
+                    refreshUrl, returnUrl);
+            strategies.append(at2.strategyName());
+            if (at2.url() != null) return new ResolvedLink(at2.url(), "account_link", strategies.toString(), null);
+            if (at2.error() != null) lastError = at2.error();
+        } else if (submitted) {
+            strategies.append("|skip_account_update(no_pending_reqs)");
+        }
+
+        // Step 3: EXPRESS LOGIN LINK — always works for a real, non-restricted Connect Express account.
+        strategies.append("|");
+        LinkAttempt lla = tryCreateExpressLoginLink(stripeConnectId);
+        strategies.append(lla.strategyName());
+        if (lla.url() != null) return new ResolvedLink(lla.url(), "login_link", strategies.toString(), null);
+        if (lla.error() != null) lastError = lla.error();
+
+        log.warn("Connect: resolveOnboarding exhausted strategies for account={} lastSeenCode={} lastMsg={}",
+                stripeConnectId,
+                lastError != null ? lastError.code() : null,
+                lastError != null ? lastError.userMessage() : null);
+        return ResolvedLink.empty(strategies.toString(), lastError);
     }
 
     public record ConnectLoginLinkRequest(@NotNull UUID storeId) {}

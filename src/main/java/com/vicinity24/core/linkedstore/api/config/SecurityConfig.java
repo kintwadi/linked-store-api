@@ -52,7 +52,7 @@ public class SecurityConfig {
                 .requestMatchers("/api/connect/**").hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER")
                 .requestMatchers("/api/fulfillment/**", "/api/inventory/**")
                     .hasAnyRole("GLOBAL_ADMIN", "STORE_ADMIN", "OWNER", "CLERK", "RUNNER")
-                .requestMatchers("/actuator/**").permitAll()
+                .requestMatchers("/actuator/**").denyAll()
                 .anyRequest().permitAll()
             );
         return http.build();

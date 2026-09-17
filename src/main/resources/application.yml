@@ -67,6 +67,27 @@ inventory:
   lock-minutes: 15
   expiry-scheduler-seconds: 30
 
+management:
+  endpoints:
+    enabled-by-default: false
+  endpoint:
+    health:
+      enabled: false
+  health:
+    defaults:
+      enabled: false
+  info:
+    defaults:
+      enabled: false
+  metrics:
+    export:
+      prometheus:
+        enabled: false
+  prometheus:
+    metrics:
+      export:
+        enabled: false
+
 server:
   port: 8080
   address: 0.0.0.0

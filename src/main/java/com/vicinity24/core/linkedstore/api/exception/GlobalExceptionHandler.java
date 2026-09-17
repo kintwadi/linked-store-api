@@ -14,11 +14,14 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.time.OffsetDateTime;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -361,6 +364,46 @@ public class GlobalExceptionHandler {
                 .errorCode("HTTP_" + status)
                 .build();
         return ResponseEntity.status(code).body(body);
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiErrorResponse> handleNoResourceFound(
+            NoResourceFoundException ex, HttpServletRequest request) {
+        log.debug("Resource not found on path {}: {}", request.getRequestURI(), ex.getMessage());
+        ApiErrorResponse body = ApiErrorResponse.builder()
+                .timestamp(OffsetDateTime.now())
+                .status(HttpStatus.NOT_FOUND.value())
+                .error("Not Found")
+                .message("The requested resource does not exist.")
+                .path(request.getRequestURI())
+                .errorCode("RESOURCE_NOT_FOUND")
+                .build();
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
+    }
+
+    /**
+     * SSE (text/event-stream) requests can throw AsyncRequestTimeoutException when the
+     * SseEmitter#completeOnTimeout fires or during graceful server shutdown. In these cases
+     * the HTTP response is already fully committed with Content-Type text/event-stream, so
+     * trying to write a JSON ApiErrorResponse body via ExceptionHandler produces a fatal
+     * "No converter for ApiErrorResponse with preset Content-Type 'text/event-stream'" warning.
+     * Handle this explicitly: log quietly at debug level (normal SSE lifecycle event), and
+     * return null which signals Spring MVC to NOT write any response body (the connection is
+     * already closed / committed anyway). The FE EventSource will then auto-reconnect as expected.
+     */
+    @ExceptionHandler(AsyncRequestTimeoutException.class)
+    public ResponseEntity<Void> handleAsyncRequestTimeout(
+            AsyncRequestTimeoutException ex, HttpServletRequest request) {
+        String ct = request.getContentType();
+        boolean isSse = request.getRequestURI() != null && request.getRequestURI().contains("/sse/")
+                || (ct != null && ct.toLowerCase(Locale.ROOT).contains("text/event-stream"));
+        if (isSse) {
+            log.debug("SSE stream timed out or closed normally on path {} (expected; EventSource reconnects automatically)",
+                    request.getRequestURI());
+        } else {
+            log.warn("Async request timeout on path {}: {}", request.getRequestURI(), ex.getMessage());
+        }
+        return null;
     }
 
     @ExceptionHandler(Exception.class)

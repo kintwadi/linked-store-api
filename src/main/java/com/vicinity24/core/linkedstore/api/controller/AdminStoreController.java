@@ -9,10 +9,13 @@ import com.stripe.param.AccountUpdateParams;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.ConnectOnboardingResponse;
 import com.vicinity24.core.linkedstore.api.dto.CreateStoreRequest;
+import com.vicinity24.core.linkedstore.api.dto.LinkAttempt;
+import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
 import com.vicinity24.core.linkedstore.api.dto.StoreAdminResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingRequest;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreTransactionResponse;
+import com.vicinity24.core.linkedstore.api.dto.StripeErrorInfo;
 import com.vicinity24.core.linkedstore.api.dto.TransactionResponse;
 import com.vicinity24.core.linkedstore.api.dto.TxEvent;
 import com.vicinity24.core.linkedstore.api.dto.TxEventType;
@@ -515,46 +518,52 @@ public class AdminStoreController {
             String refreshUrl = (body != null && body.get("refreshUrl") != null)
                     ? body.get("refreshUrl") : defaultRefreshUrl;
 
-            String url = ConnectController.tryCreateAccountLink(stripeConnectId,
-                    AccountLinkCreateParams.Type.ACCOUNT_ONBOARDING,
-                    AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
-            String strategy = "account_onboarding_currently_due";
-            String object = "account_link";
-            if (url == null && !isNewAccount) {
-                url = ConnectController.tryCreateAccountLink(stripeConnectId,
-                        AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
-                        AccountLinkCreateParams.Collect.EVENTUALLY_DUE, refreshUrl, returnUrl);
-                strategy = "account_update_eventually_due";
+            ResolvedLink resolved = ConnectController.resolveOnboardingOrDashboardLink(
+                    stripeConnectId, isNewAccount, refreshUrl, returnUrl);
+
+            if (resolved.url() == null) {
+                String message = "Stripe could not create a re-onboarding session. Finish the initial "
+                        + "Connect Stripe flow (submit business details, bank account, and required verifications) "
+                        + "once, then retry.";
+                if (resolved.lastError() != null) {
+                    StringBuilder sb = new StringBuilder();
+                    if (resolved.lastError().userMessage() != null
+                            && !resolved.lastError().userMessage().isBlank()) {
+                        sb.append(resolved.lastError().userMessage());
+                    }
+                    if (resolved.lastError().code() != null && !resolved.lastError().code().isBlank()) {
+                        if (!sb.isEmpty()) sb.append(" ");
+                        sb.append("(Stripe code: ").append(resolved.lastError().code()).append(")");
+                    }
+                    if (resolved.lastError().declineCode() != null && !resolved.lastError().declineCode().isBlank()) {
+                        if (!sb.isEmpty()) sb.append(" ");
+                        sb.append("(decline: ").append(resolved.lastError().declineCode()).append(")");
+                    }
+                    if (!sb.isEmpty()) message = sb.toString();
+                }
+                log.warn("AdminConnect: re-onboard exhausted strategies for store={} account={} tried={}",
+                        store.getId(), stripeConnectId, resolved.strategiesTried());
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
+                        .status("error")
+                        .message(message)
+                        .storeId(store.getId())
+                        .stripeConnectId(stripeConnectId)
+                        .build());
             }
-            if (url == null && !isNewAccount) {
-                url = ConnectController.tryCreateAccountLink(stripeConnectId,
-                        AccountLinkCreateParams.Type.ACCOUNT_UPDATE,
-                        AccountLinkCreateParams.Collect.CURRENTLY_DUE, refreshUrl, returnUrl);
-                strategy = "account_update_currently_due";
-            }
-            if (url == null) {
-                url = ConnectController.tryCreateExpressLoginLink(stripeConnectId);
-                strategy = strategy + "|login_link_fallback";
-                object = "login_link";
-            }
-            if (url == null) {
-                url = "https://dashboard.stripe.com/express/" + stripeConnectId;
-                strategy = strategy + "|express_dashboard_manual";
-                object = "express_dashboard";
-                log.warn("AdminConnect: no AccountLink/LoginLink for {} → manual Express dashboard URL.", stripeConnectId);
-            }
+
             return ResponseEntity.status(HttpStatus.CREATED).body(ConnectOnboardingResponse.builder()
-                    .url(url)
-                    .object(object)
+                    .url(resolved.url())
+                    .object(resolved.object())
                     .status(isNewAccount ? "new_account" : "existing_account")
                     .stripeConnectId(stripeConnectId)
                     .storeId(store.getId())
-                    .message(strategy)
+                    .message(resolved.strategiesTried())
                     .build());
         } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
                     .status("error")
-                    .message(ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage())
+                    .message(sei.userMessage() != null ? sei.userMessage() : ex.getMessage())
                     .storeId(store.getId())
                     .build());
         }
@@ -572,15 +581,41 @@ public class AdminStoreController {
         }
         try {
             Account account = Account.retrieve(store.getStripeConnectId());
-            String url = ConnectController.tryCreateExpressLoginLink(store.getStripeConnectId());
+            LinkAttempt loginAttempt =
+                    ConnectController.tryCreateExpressLoginLink(store.getStripeConnectId());
+            String url = loginAttempt.url();
             String object = "login_link";
             String message = "express_login_link";
             if (url == null) {
-                url = "https://dashboard.stripe.com/express/" + store.getStripeConnectId();
-                object = "express_dashboard";
-                message = "login_link_not_available|express_dashboard_manual";
-                log.warn("AdminConnect: createLoginLink failed Express LoginLink, manual Express dashboard fallback for {}",
-                        store.getStripeConnectId());
+                // DO NOT use a hand-crafted dashboard.stripe.com/express/{connectId} URL. It 302-redirects to
+                // connect.stripe.com/express/{id} which 404s (Stripe routes do not expose Connect accounts that way).
+                // Instead return a clean error so the frontend alerts the admin user with the real problem.
+                StringBuilder sb = new StringBuilder();
+                sb.append("Stripe Express dashboard session could not be created. This usually means the merchant "
+                        + "has not finished submitting onboarding details yet. Click 'Connect Stripe' / 'Re-onboard' once to "
+                        + "complete the initial Connect flow, then retry opening the dashboard.");
+                if (loginAttempt.error() != null) {
+                    if (loginAttempt.error().userMessage() != null && !loginAttempt.error().userMessage().isBlank()) {
+                        sb.setLength(0);
+                        sb.append(loginAttempt.error().userMessage());
+                    }
+                    if (loginAttempt.error().code() != null && !loginAttempt.error().code().isBlank()) {
+                        sb.append(" (Stripe code: ").append(loginAttempt.error().code()).append(")");
+                    }
+                    if (loginAttempt.error().declineCode() != null && !loginAttempt.error().declineCode().isBlank()) {
+                        sb.append(" (decline: ").append(loginAttempt.error().declineCode()).append(")");
+                    }
+                }
+                log.warn("AdminConnect: createLoginLink failed Express LoginLink for store={}, account={}",
+                        store.getId(), store.getStripeConnectId());
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
+                        .status("error")
+                        .message(sb.toString())
+                        .storeId(store.getId())
+                        .stripeConnectId(store.getStripeConnectId())
+                        .chargesEnabled(account.getChargesEnabled())
+                        .payoutsEnabled(account.getPayoutsEnabled())
+                        .build());
             }
             return ResponseEntity.ok(ConnectOnboardingResponse.builder()
                     .url(url)
@@ -593,9 +628,10 @@ public class AdminStoreController {
                     .payoutsEnabled(account.getPayoutsEnabled())
                     .build());
         } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(ConnectOnboardingResponse.builder()
                     .status("error")
-                    .message(ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage())
+                    .message(sei.userMessage() != null ? sei.userMessage() : ex.getMessage())
                     .storeId(store.getId())
                     .build());
         }
