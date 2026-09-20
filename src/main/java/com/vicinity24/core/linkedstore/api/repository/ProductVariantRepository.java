@@ -3,6 +3,9 @@ package com.vicinity24.core.linkedstore.api.repository;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
 import com.vicinity24.core.linkedstore.api.entity.VariantStatus;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.Tuple;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
@@ -22,6 +25,82 @@ public interface ProductVariantRepository extends JpaRepository<ProductVariant, 
     List<ProductVariant> findByProductId(UUID productId);
 
     List<ProductVariant> findByStoreIdAndStatus(UUID storeId, VariantStatus status);
+
+    @Query(value = """
+        SELECT pv.* FROM product_variants pv
+        LEFT JOIN products p ON p.id = pv.product_id
+        LEFT JOIN stores s ON s.id = pv.store_id
+        WHERE (:storeIds IS NULL OR pv.store_id IN (:storeIds))
+          AND (:statuses IS NULL OR pv.status IN (:statuses))
+          AND (:query IS NULL OR :query = '' OR
+               LOWER(pv.sku) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(p.title) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(p.description) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(s.business_name) LIKE LOWER(CONCAT('%', :query, '%')))
+        ORDER BY s.business_name ASC NULLS LAST, LOWER(p.title) ASC NULLS LAST
+        """,
+        countQuery = """
+        SELECT COUNT(pv.id) FROM product_variants pv
+        LEFT JOIN products p ON p.id = pv.product_id
+        LEFT JOIN stores s ON s.id = pv.store_id
+        WHERE (:storeIds IS NULL OR pv.store_id IN (:storeIds))
+          AND (:statuses IS NULL OR pv.status IN (:statuses))
+          AND (:query IS NULL OR :query = '' OR
+               LOWER(pv.sku) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(p.title) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(p.description) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               LOWER(s.business_name) LIKE LOWER(CONCAT('%', :query, '%')))
+        """,
+        nativeQuery = true)
+    Page<ProductVariant> findVariantsPaged(
+            @Param("storeIds") List<UUID> storeIds,
+            @Param("statuses") List<String> statuses,
+            @Param("query") String query,
+            Pageable pageable);
+
+    @Query(value = """
+        SELECT pv.store_id AS storeId, s.business_name AS storeName, COUNT(*) AS cnt
+        FROM product_variants pv
+        LEFT JOIN stores s ON s.id = pv.store_id
+        WHERE (:storeIds IS NULL OR pv.store_id IN (:storeIds))
+          AND (:statuses IS NULL OR pv.status IN (:statuses))
+          AND (:query IS NULL OR :query = '' OR
+               LOWER(pv.sku) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               EXISTS (SELECT 1 FROM products p WHERE p.id = pv.product_id AND (
+                   LOWER(p.title) LIKE LOWER(CONCAT('%', :query, '%')) OR
+                   LOWER(p.description) LIKE LOWER(CONCAT('%', :query, '%'))
+               )) OR
+               EXISTS (SELECT 1 FROM stores s2 WHERE s2.id = pv.store_id AND
+                   LOWER(s2.business_name) LIKE LOWER(CONCAT('%', :query, '%'))))
+        GROUP BY pv.store_id, s.business_name
+        ORDER BY s.business_name ASC NULLS LAST
+        """, nativeQuery = true)
+    List<Tuple> aggregateStoreTotals(
+            @Param("storeIds") List<UUID> storeIds,
+            @Param("statuses") List<String> statuses,
+            @Param("query") String query);
+
+    @Query(value = """
+        SELECT pv.status AS statusKey, COUNT(*) AS cnt
+        FROM product_variants pv
+        LEFT JOIN stores s ON s.id = pv.store_id
+        WHERE (:storeIds IS NULL OR pv.store_id IN (:storeIds))
+          AND (:statuses IS NULL OR pv.status IN (:statuses))
+          AND (:query IS NULL OR :query = '' OR
+               LOWER(pv.sku) LIKE LOWER(CONCAT('%', :query, '%')) OR
+               EXISTS (SELECT 1 FROM products p WHERE p.id = pv.product_id AND (
+                   LOWER(p.title) LIKE LOWER(CONCAT('%', :query, '%')) OR
+                   LOWER(p.description) LIKE LOWER(CONCAT('%', :query, '%'))
+               )) OR
+               EXISTS (SELECT 1 FROM stores s2 WHERE s2.id = pv.store_id AND
+                   LOWER(s2.business_name) LIKE LOWER(CONCAT('%', :query, '%'))))
+        GROUP BY pv.status
+        ORDER BY pv.status ASC
+        """, nativeQuery = true)
+    List<Tuple> aggregateStatusTotals(
+            @Param("storeIds") List<UUID> storeIds,
+            @Param("statuses") List<String> statuses,
+            @Param("query") String query);
 
     List<ProductVariant> findByProductIdAndStatusOrderByRetailPriceCentsAsc(UUID productId, VariantStatus status);
 

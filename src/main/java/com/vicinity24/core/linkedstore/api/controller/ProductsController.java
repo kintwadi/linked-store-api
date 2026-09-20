@@ -93,6 +93,38 @@ public class ProductsController {
         return ResponseEntity.ok(m);
     }
 
+    @GetMapping("/variants/{variantId}")
+    public ResponseEntity<Map<String, Object>> getVariant(@PathVariable String variantId) {
+        UUID vid;
+        try { vid = UUID.fromString(variantId); }
+        catch (IllegalArgumentException e) { return ResponseEntity.status(HttpStatus.BAD_REQUEST).build(); }
+        Optional<ProductVariant> opt = variantRepository.findByIdWithProduct(vid);
+        if (opt.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
+        ProductVariant v = opt.get();
+        Map<String, Object> vm = new LinkedHashMap<>();
+        vm.put("id", v.getId().toString());
+        vm.put("sku", v.getSku());
+        vm.put("retailPriceCents", v.getRetailPriceCents());
+        vm.put("wholesalePriceCents", v.getWholesalePriceCents());
+        vm.put("imageUrl", v.getImageUrl());
+        vm.put("stockQuantity", v.getStockQuantity());
+        vm.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
+        vm.put("status", v.getStatus() != null ? v.getStatus().name() : null);
+        vm.put("variantAttributes", v.getVariantAttributes());
+        if (v.getProduct() != null) {
+            Map<String, Object> pm = new LinkedHashMap<>();
+            pm.put("id", v.getProduct().getId().toString());
+            pm.put("title", v.getProduct().getTitle());
+            pm.put("primaryImageUrl", v.getProduct().getPrimaryImageUrl());
+            pm.put("thumbnailUrl", v.getProduct().getThumbnailUrl());
+            pm.put("status", v.getProduct().getStatus() != null ? v.getProduct().getStatus().name() : null);
+            vm.put("product", pm);
+        }
+        return ResponseEntity.ok(vm);
+    }
+
     private Product resolveProductOne(String productId) {
         try {
             UUID productUuid = UUID.fromString(productId);

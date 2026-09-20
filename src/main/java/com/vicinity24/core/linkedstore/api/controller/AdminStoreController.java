@@ -14,6 +14,7 @@ import com.vicinity24.core.linkedstore.api.dto.LinkAttempt;
 import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
 import com.vicinity24.core.linkedstore.api.dto.StoreAdminResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingRequest;
+import com.vicinity24.core.linkedstore.api.dto.PaginatedResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInventoryListingResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreInviteResponse;
 import com.vicinity24.core.linkedstore.api.dto.StoreTransactionResponse;
@@ -53,14 +54,19 @@ import com.vicinity24.core.linkedstore.api.repository.UserAccountRepository;
 import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
 import com.vicinity24.core.linkedstore.api.security.CurrentUser;
 import com.vicinity24.core.linkedstore.api.security.permission.PermissionService;
+import jakarta.persistence.Tuple;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -68,12 +74,18 @@ import java.math.BigDecimal;
 import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Slf4j
 @RestController
@@ -201,16 +213,15 @@ public class AdminStoreController {
     // ---------- "me" inventory endpoints ----------
 
     @GetMapping("/me/inventory")
-    public ResponseEntity<?> getMyInventory() {
+    public ResponseEntity<?> getMyInventory(
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "size", defaultValue = "20000") int size,
+            @RequestParam(name = "query", required = false) String query,
+            @RequestParam(name = "statuses", required = false) List<String> statuses) {
         CurrentUser current = authenticationFacade.current();
         Store store = resolveMyStore(current);
-        List<ProductVariant> variants = productVariantRepository.findByStoreId(store.getId());
-        List<StoreInventoryListingResponse> result = new ArrayList<>();
-        for (ProductVariant pv : variants) {
-            if (pv.getStatus() == VariantStatus.INACTIVE) continue;
-            result.add(buildInventoryResponse(pv));
-        }
-        return ResponseEntity.ok(result);
+        return ResponseEntity.ok(buildPaginatedInventoryResponse(
+                Collections.singletonList(store.getId()), query, statuses, page, size, true));
     }
 
     @PostMapping("/me/inventory")
@@ -260,6 +271,47 @@ public class AdminStoreController {
         return ResponseEntity.ok(buildInventoryResponse(variant));
     }
 
+    // ---------- Unified inventory across all stores (visible to REP / CLERK / RUNNER / STORE_ADMIN / OWNER / GLOBAL_ADMIN) ----------
+
+    @GetMapping("/inventory/all")
+    public ResponseEntity<?> getAllInventory(
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "size", defaultValue = "6") int size,
+            @RequestParam(name = "query", required = false) String query,
+            @RequestParam(name = "storeIds", required = false) List<UUID> storeIds,
+            @RequestParam(name = "statuses", required = false) List<String> statuses) {
+        CurrentUser current = authenticationFacade.current();
+        List<Store> allStores = storeRepository.findAll();
+        List<UUID> visibleStoreIds = new ArrayList<>();
+        for (Store store : allStores) {
+            if (permissionService.canViewProductsOfStore(current, store.getId())) {
+                visibleStoreIds.add(store.getId());
+            }
+        }
+        List<UUID> filteredStoreIds;
+        if (storeIds == null || storeIds.isEmpty()) {
+            filteredStoreIds = visibleStoreIds;
+        } else {
+            Set<UUID> visible = new HashSet<>(visibleStoreIds);
+            filteredStoreIds = storeIds.stream().filter(visible::contains).collect(Collectors.toList());
+        }
+        if (filteredStoreIds.isEmpty()) {
+            return ResponseEntity.ok(PaginatedResponse.<StoreInventoryListingResponse>builder()
+                    .content(Collections.emptyList())
+                    .page(page)
+                    .size(size)
+                    .totalElements(0L)
+                    .totalPages(0)
+                    .first(true)
+                    .last(true)
+                    .empty(true)
+                    .storeTotals(Collections.emptyList())
+                    .statusTotals(Collections.emptyList())
+                    .build());
+        }
+        return ResponseEntity.ok(buildPaginatedInventoryResponse(filteredStoreIds, query, statuses, page, size, false));
+    }
+
     // ---------- "me" transactions endpoint ----------
 
     @GetMapping("/me/transactions")
@@ -273,10 +325,14 @@ public class AdminStoreController {
 
     @GetMapping("")
     public ResponseEntity<?> listStores() {
-        authenticationFacade.requireGlobalAdmin();
+        CurrentUser current = authenticationFacade.current();
         List<Store> stores = storeRepository.findAll();
         List<StoreAdminResponse> result = new ArrayList<>();
         for (Store store : stores) {
+            if (!permissionService.canViewStore(current, store.getId())
+                    && !permissionService.canViewProductsOfStore(current, store.getId())) {
+                continue;
+            }
             result.add(buildStoreAdminResponse(store));
         }
         return ResponseEntity.ok(result);
@@ -398,18 +454,18 @@ public class AdminStoreController {
     // ---------- Global admin: Inventory per store by id ----------
 
     @GetMapping("/{id}/inventory")
-    public ResponseEntity<?> getStoreInventory(@PathVariable("id") UUID id) {
+    public ResponseEntity<?> getStoreInventory(
+            @PathVariable("id") UUID id,
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "size", defaultValue = "20000") int size,
+            @RequestParam(name = "query", required = false) String query,
+            @RequestParam(name = "statuses", required = false) List<String> statuses) {
         CurrentUser c = authenticationFacade.current();
         permissionService.ensureViewProductsOfStore(c, id);
-        Store store = storeRepository.findById(id)
+        storeRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
-        List<ProductVariant> variants = productVariantRepository.findByStoreId(store.getId());
-        List<StoreInventoryListingResponse> result = new ArrayList<>();
-        for (ProductVariant pv : variants) {
-            if (pv.getStatus() == VariantStatus.INACTIVE) continue;
-            result.add(buildInventoryResponse(pv));
-        }
-        return ResponseEntity.ok(result);
+        return ResponseEntity.ok(buildPaginatedInventoryResponse(
+                Collections.singletonList(id), query, statuses, page, size, true));
     }
 
     @PostMapping("/{id}/inventory")
@@ -815,7 +871,7 @@ public class AdminStoreController {
     @Transactional
     public ResponseEntity<?> storeMarkReady(@PathVariable UUID storeId, @PathVariable UUID txId) {
         final CurrentUser cu = authenticationFacade.current();
-        authenticationFacade.requireStoreAdminOrOwner(storeId);
+        permissionService.ensureCanManageStoreRequests(cu, storeId);
         return doMarkReady(txId, storeId);
     }
 
@@ -824,6 +880,7 @@ public class AdminStoreController {
     public ResponseEntity<?> myStoreMarkReady(@PathVariable UUID txId) {
         final CurrentUser cu = authenticationFacade.current();
         final Store store = resolveMyStore(cu);
+        permissionService.ensureCanManageStoreRequests(cu, store.getId());
         return doMarkReady(txId, store.getId());
     }
 
@@ -858,7 +915,8 @@ public class AdminStoreController {
     @PostMapping(value = "/{storeId}/transactions/{txId}/mark-unavailable")
     @Transactional
     public ResponseEntity<?> storeMarkUnavailable(@PathVariable UUID storeId, @PathVariable UUID txId) {
-        authenticationFacade.requireStoreAdminOrOwner(storeId);
+        final CurrentUser cu = authenticationFacade.current();
+        permissionService.ensureCanManageStoreRequests(cu, storeId);
         return doMarkUnavailable(txId, storeId, "Store marked item unavailable (out of stock during hold)");
     }
 
@@ -867,6 +925,7 @@ public class AdminStoreController {
     public ResponseEntity<?> myStoreMarkUnavailable(@PathVariable UUID txId) {
         final CurrentUser cu = authenticationFacade.current();
         final Store store = resolveMyStore(cu);
+        permissionService.ensureCanManageStoreRequests(cu, store.getId());
         return doMarkUnavailable(txId, store.getId(), "Store marked item unavailable");
     }
 
@@ -1161,9 +1220,139 @@ public class AdminStoreController {
         }
     }
 
+    private PaginatedResponse<StoreInventoryListingResponse> buildPaginatedInventoryResponse(
+            List<UUID> storeIds,
+            String query,
+            List<String> statusesParam,
+            int page,
+            int size,
+            boolean perStoreView) {
+
+        final List<String> normalizedStatuses;
+        if (statusesParam == null || statusesParam.isEmpty()) {
+            normalizedStatuses = null;
+        } else {
+            Set<String> valid = Arrays.stream(VariantStatus.values())
+                    .map(Enum::name)
+                    .collect(Collectors.toSet());
+            normalizedStatuses = statusesParam.stream()
+                    .filter(s -> s != null && valid.contains(s))
+                    .collect(Collectors.toList());
+        }
+
+        final List<String> statusesForQuery;
+        if (normalizedStatuses == null) {
+            statusesForQuery = VariantStatus.ALL_NON_INACTIVE;
+        } else {
+            statusesForQuery = normalizedStatuses;
+        }
+
+        String q = StringUtils.hasText(query) ? query.trim() : null;
+
+        final List<UUID> storeIdsForQuery = (storeIds == null || storeIds.isEmpty()) ? null : storeIds;
+
+        int safeSize = Math.max(1, Math.min(size, 50000));
+        int safePage = Math.max(0, page);
+        Pageable pageable = PageRequest.of(safePage, safeSize);
+
+        Page<ProductVariant> paged = productVariantRepository.findVariantsPaged(
+                storeIdsForQuery, statusesForQuery, q, pageable);
+
+        final Map<UUID, Product> productCache = new HashMap<>();
+        final Map<UUID, String> storeNamesCache = new HashMap<>();
+
+        List<StoreInventoryListingResponse> content = new ArrayList<>(paged.getNumberOfElements());
+        for (ProductVariant pv : paged.getContent()) {
+            Product p = productCache.computeIfAbsent(pv.getProductId(), id ->
+                    productRepository.findById(id).orElseThrow(() ->
+                            new ResourceNotFoundException("Product", id.toString())));
+            String storeName = storeNamesCache.computeIfAbsent(pv.getStoreId(), id ->
+                    storeRepository.findById(id).map(Store::getBusinessName).orElse(null));
+            content.add(StoreInventoryListingResponse.builder()
+                    .variantId(pv.getId())
+                    .productId(p.getId())
+                    .productTitle(p.getTitle())
+                    .productDescription(p.getDescription())
+                    .productImageUrl(p.getPrimaryImageUrl())
+                    .productGalleryImageUrls(p.getGalleryImageUrls())
+                    .storeId(pv.getStoreId())
+                    .storeName(storeName)
+                    .sku(pv.getSku())
+                    .wholesalePriceCents(pv.getWholesalePriceCents())
+                    .retailPriceCents(pv.getRetailPriceCents())
+                    .stockQuantity(pv.getStockQuantity())
+                    .status(pv.getStatus() != null ? pv.getStatus().name() : null)
+                    .variantImageUrl(pv.getImageUrl())
+                    .variantGalleryImageUrls(pv.getGalleryImageUrls())
+                    .variantAttributes(pv.getVariantAttributes())
+                    .createdAt(pv.getCreatedAt())
+                    .build());
+        }
+
+        List<String> statusesForTotals;
+        if (normalizedStatuses == null) {
+            statusesForTotals = VariantStatus.ALL_NON_INACTIVE;
+        } else {
+            statusesForTotals = normalizedStatuses;
+        }
+
+        List<Tuple> storeTuples = productVariantRepository.aggregateStoreTotals(
+                storeIdsForQuery, statusesForTotals, q);
+        List<PaginatedResponse.StoreTotals> storeTotals = new ArrayList<>(storeTuples.size());
+        for (Tuple t : storeTuples) {
+            Object sid = t.get("storeId");
+            UUID storeId = sid instanceof UUID ? (UUID) sid : (sid != null ? UUID.fromString(sid.toString()) : null);
+            Object sname = t.get("storeName");
+            Object cnt = t.get("cnt");
+            long count = 0L;
+            if (cnt instanceof Number) count = ((Number) cnt).longValue();
+            else if (cnt != null) {
+                try { count = Long.parseLong(cnt.toString()); } catch (NumberFormatException ignored) {}
+            }
+            storeTotals.add(PaginatedResponse.StoreTotals.builder()
+                    .storeId(storeId != null ? storeId.toString() : null)
+                    .storeName(sname != null ? sname.toString() : null)
+                    .count(count)
+                    .build());
+        }
+
+        List<Tuple> statusTuples = productVariantRepository.aggregateStatusTotals(
+                storeIdsForQuery, statusesForTotals, q);
+        List<PaginatedResponse.StatusTotals> statusTotals = new ArrayList<>(statusTuples.size());
+        for (Tuple t : statusTuples) {
+            Object key = t.get("statusKey");
+            Object cnt = t.get("cnt");
+            long count = 0L;
+            if (cnt instanceof Number) count = ((Number) cnt).longValue();
+            else if (cnt != null) {
+                try { count = Long.parseLong(cnt.toString()); } catch (NumberFormatException ignored) {}
+            }
+            statusTotals.add(PaginatedResponse.StatusTotals.builder()
+                    .key(key != null ? key.toString() : null)
+                    .count(count)
+                    .build());
+        }
+
+        return PaginatedResponse.<StoreInventoryListingResponse>builder()
+                .content(content)
+                .page(safePage)
+                .size(safeSize)
+                .totalElements(paged.getTotalElements())
+                .totalPages(paged.getTotalPages())
+                .first(paged.isFirst())
+                .last(paged.isLast())
+                .empty(paged.isEmpty())
+                .storeTotals(storeTotals)
+                .statusTotals(statusTotals)
+                .build();
+    }
+
     private StoreInventoryListingResponse buildInventoryResponse(ProductVariant variant) {
         Product product = productRepository.findById(variant.getProductId())
                 .orElseThrow(() -> new ResourceNotFoundException("Product", variant.getProductId().toString()));
+        String storeName = storeRepository.findById(variant.getStoreId())
+                .map(Store::getBusinessName)
+                .orElse(null);
         return StoreInventoryListingResponse.builder()
                 .variantId(variant.getId())
                 .productId(product.getId())
@@ -1172,6 +1361,7 @@ public class AdminStoreController {
                 .productImageUrl(product.getPrimaryImageUrl())
                 .productGalleryImageUrls(product.getGalleryImageUrls())
                 .storeId(variant.getStoreId())
+                .storeName(storeName)
                 .sku(variant.getSku())
                 .wholesalePriceCents(variant.getWholesalePriceCents())
                 .retailPriceCents(variant.getRetailPriceCents())

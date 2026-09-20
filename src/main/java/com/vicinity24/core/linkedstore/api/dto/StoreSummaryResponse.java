@@ -24,4 +24,7 @@ public class StoreSummaryResponse {
     private Boolean payoutsEnabled;
     private String subscriptionStatus;
     private String logoUrl;
+    private String gatewayCode;
+    private String address;
+    private String postalCode;
 }

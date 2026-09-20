@@ -4,6 +4,8 @@ import com.stripe.Stripe;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutPayRequest;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutPayResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.exception.*;
 import com.vicinity24.core.linkedstore.api.payment.PayoutRequest;
@@ -13,11 +15,14 @@ import com.vicinity24.core.linkedstore.api.payment.PaymentRequest;
 import com.vicinity24.core.linkedstore.api.payment.PaymentResponse;
 import com.vicinity24.core.linkedstore.api.payment.PayoutResponse;
 import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -26,6 +31,7 @@ import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Slf4j
@@ -39,8 +45,11 @@ public class CheckoutService {
     private final StoreRepository storeRepository;
     private final StoreUserRepository storeUserRepository;
     private final QrTokenRepository qrTokenRepository;
+    private final ProductRepository productRepository;
+    private final ProductVariantRepository productVariantRepository;
     private final StripeConfig stripeConfig;
     private final PaymentProviderFactory paymentProviderFactory;
+    private final TransactionEventBroadcaster eventBroadcaster;
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
@@ -150,6 +159,54 @@ public class CheckoutService {
                 transactionId, paymentIntent.getPaymentIntentId(), transferGroup,
                 wholesalePayoutCents, marginCents, platformFeeCents, qrToken.getId());
 
+        try {
+            UUID variantId = locks.isEmpty() ? null : locks.get(0).getVariantId();
+            String sku = null;
+            String productTitle = null;
+            String productImageUrl = null;
+            UUID productId = null;
+            if (variantId != null) {
+                Optional<ProductVariant> vOpt = productVariantRepository.findByIdWithProduct(variantId);
+                if (vOpt.isPresent()) {
+                    ProductVariant v = vOpt.get();
+                    sku = v.getSku();
+                    productId = v.getProductId();
+                    if (v.getImageUrl() != null && !v.getImageUrl().isBlank()) productImageUrl = v.getImageUrl();
+                    if (v.getProduct() != null) {
+                        productTitle = v.getProduct().getTitle();
+                        if ((productImageUrl == null || productImageUrl.isBlank())
+                                && v.getProduct().getPrimaryImageUrl() != null) {
+                            productImageUrl = v.getProduct().getPrimaryImageUrl();
+                        }
+                    }
+                }
+            }
+            BigDecimal price = BigDecimal.valueOf(totalCents).setScale(2, RoundingMode.UNNECESSARY)
+                    .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY);
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.PAID)
+                    .createdAt(now)
+                    .transactionId(transaction.getId())
+                    .storeId(fulfillingStore.getId())
+                    .fulfillingStoreId(fulfillingStore.getId())
+                    .originatingStoreId(originatingStore.getId())
+                    .variantId(variantId)
+                    .productId(productId)
+                    .productTitle(productTitle)
+                    .productImageUrl(productImageUrl)
+                    .sku(sku)
+                    .retailPrice(price)
+                    .currency("USD")
+                    .expiresAt(qrExpiresAt)
+                    .qrFallbackCode(fallbackCode)
+                    .runnerId(runnerId != null ? runnerId.toString() : null)
+                    .status(TransactionStatus.PAID.name())
+                    .message("Customer completed payment. Ready for in-store pickup.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("CheckoutService: broadcast PAID failed txId={}", transactionId, ex);
+        }
+
         return CheckoutPayResponse.builder()
                 .transactionId(transaction.getId())
                 .transactionStatus(transaction.getStatus().name())
@@ -246,6 +303,18 @@ public class CheckoutService {
                 originatingStoreId, StoreUserRole.OWNER);
         if (!owners.isEmpty()) {
             return owners.get(0).getId();
+        }
+
+        List<StoreUser> storeAdmins = storeUserRepository.findByStoreIdAndRole(
+                originatingStoreId, StoreUserRole.STORE_ADMIN);
+        if (!storeAdmins.isEmpty()) {
+            return storeAdmins.get(0).getId();
+        }
+
+        List<StoreUser> representatives = storeUserRepository.findByStoreIdAndRole(
+                originatingStoreId, StoreUserRole.STORE_REPRESENTATIVE);
+        if (!representatives.isEmpty()) {
+            return representatives.get(0).getId();
         }
 
         List<StoreUser> clerks = storeUserRepository.findByStoreIdAndRole(

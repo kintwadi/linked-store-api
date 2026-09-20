@@ -86,9 +86,7 @@ public class ReservationController {
             Optional<ProductVariant> variantOpt = variantRepository.findByIdWithSufficientStock(variantUuid, 1);
             if (variantOpt.isPresent()) {
                 ProductVariant v = variantOpt.get();
-                if (!v.getStoreId().equals(originatingStoreId)
-                        && v.getStatus() == VariantStatus.ACTIVE
-                        && v.getProductId().equals(productUuid)) {
+                if (v.getStatus() == VariantStatus.ACTIVE && v.getProductId().equals(productUuid)) {
                     variant = v;
                 }
             }
@@ -99,6 +97,12 @@ public class ReservationController {
                     .filter(v -> v.getStockQuantity() >= 1 && !v.getStoreId().equals(originatingStoreId))
                     .findFirst()
                     .orElse(null);
+            if (variant == null) {
+                variant = variants.stream()
+                        .filter(v -> v.getStockQuantity() >= 1 && v.getStoreId().equals(originatingStoreId))
+                        .findFirst()
+                        .orElse(null);
+            }
         }
 
         if (variant == null) {
@@ -112,14 +116,6 @@ public class ReservationController {
         Store fulfilling = storeRepository.findById(variant.getStoreId())
                 .orElse(null);
         if (fulfilling == null) {
-            return ResponseEntity.ok(ReservationResponse.builder()
-                    .accepted(false)
-                    .status("unavailable")
-                    .message("No participating store has this item in stock.")
-                    .build());
-        }
-
-        if (originatingStoreId.equals(variant.getStoreId())) {
             return ResponseEntity.ok(ReservationResponse.builder()
                     .accepted(false)
                     .status("unavailable")
@@ -170,6 +166,8 @@ public class ReservationController {
         inventoryLockRepository.save(lock);
 
         UUID runnerId = assignRunnerForOriginatingStoreInline(originatingStoreId);
+        tx.setRunnerId(runnerId);
+        tx = transactionRepository.save(tx);
 
         String secureToken = generateSecureTokenInline(tx.getId(), runnerId, now);
         String fallbackCode = generateFallbackCodeInline();
@@ -252,6 +250,18 @@ public class ReservationController {
                 originatingStoreId, StoreUserRole.OWNER);
         if (!owners.isEmpty()) {
             return owners.get(0).getId();
+        }
+
+        List<StoreUser> storeAdmins = storeUserRepository.findByStoreIdAndRole(
+                originatingStoreId, StoreUserRole.STORE_ADMIN);
+        if (!storeAdmins.isEmpty()) {
+            return storeAdmins.get(0).getId();
+        }
+
+        List<StoreUser> representatives = storeUserRepository.findByStoreIdAndRole(
+                originatingStoreId, StoreUserRole.STORE_REPRESENTATIVE);
+        if (!representatives.isEmpty()) {
+            return representatives.get(0).getId();
         }
 
         List<StoreUser> clerks = storeUserRepository.findByStoreIdAndRole(

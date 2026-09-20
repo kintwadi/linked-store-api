@@ -47,7 +47,10 @@ public class SecurityConfig {
                         "/api/pickup/verify", "/api/transactions/*/mark-paid").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/connect/webhook").permitAll()
                 .requestMatchers(HttpMethod.GET, "/api/connect/health").permitAll()
-                .requestMatchers("/sse/**", "/sse/*/**").hasAnyRole(
+                .requestMatchers("/sse/**", "/sse/*/**",
+                        "/api/admin/sse/**",
+                        "/api/stores/*/sse/**",
+                        "/api/stores/me/sse/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/api/admin/stores/me", "/api/admin/stores/me/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
@@ -69,6 +72,10 @@ public class SecurityConfig {
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
                 .requestMatchers(HttpMethod.GET, "/api/admin/stores/*/connect/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
+                .requestMatchers(HttpMethod.GET, "/api/admin/stores/inventory/all").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
+                .requestMatchers(HttpMethod.GET, "/api/admin/stores").hasAnyRole(
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/api/admin/stores/**").hasRole("GLOBAL_ADMIN")
                 .requestMatchers("/api/admin/transactions/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")

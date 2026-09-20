@@ -34,6 +34,22 @@ class AdminPermissionGuard {
         return role == UserRole.OWNER || role == UserRole.STORE_ADMIN;
     }
 
+    boolean canManageStoreRequests(CurrentUser caller, UUID storeId) {
+        if (caller == null || !caller.isAuthenticated()) return false;
+        if (caller.isGlobalAdmin()) return true;
+        if (storeId == null || caller.getStoreId() == null
+                || !caller.getStoreId().equals(storeId)) {
+            return false;
+        }
+        UserRole role = caller.getRole();
+        // Owner/Admin/Representative/Clerk can accept or deny pickup reservations.
+        // Runner only does pickup (FulfillmentService verify-pickup scan path handled separately).
+        return role == UserRole.OWNER
+                || role == UserRole.STORE_ADMIN
+                || role == UserRole.STORE_REPRESENTATIVE
+                || role == UserRole.CLERK;
+    }
+
     boolean canPromoteRoleTo(CurrentUser caller, UserRole targetRole) {
         if (caller == null || !caller.isAuthenticated()) return false;
         if (targetRole == null) return false;

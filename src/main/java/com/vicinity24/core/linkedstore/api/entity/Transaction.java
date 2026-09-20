@@ -63,6 +63,13 @@ public class Transaction {
     @Column(name = "status", nullable = false, length = 50)
     private TransactionStatus status;
 
+    @Column(name = "runner_id")
+    private UUID runnerId;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "runner_id", insertable = false, updatable = false)
+    private UserAccount runner;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 

@@ -37,15 +37,15 @@ public class TransactionEventController {
     /** Store-owner / clerk-scoped SSE stream for a single store. */
     @GetMapping(value = "/api/stores/{storeId}/sse/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter storeStream(@PathVariable("storeId") String storeIdStr) {
-        UUID storeId;
-        try { storeId = UUID.fromString(storeIdStr); }
-        catch (IllegalArgumentException e) { throw new SecurityException("Invalid store id"); }
+        UUID storeId = parseStoreId(storeIdStr);
+        authorizeStoreAccess(storeId);
+        return broadcaster.registerStore(storeId);
+    }
 
-        Store store = storeRepository.findById(storeId).orElseThrow(() -> new SecurityException("Store not found"));
-        final CurrentUser cu = auth.current();
-        if (!cu.isGlobalAdmin() && (cu.getStoreId() == null || !cu.getStoreId().equals(store.getId()))) {
-            throw new SecurityException("You do not belong to this store");
-        }
+    /** Store-owner / clerk-scoped SSE stream for the currently authenticated store. */
+    @GetMapping(value = "/api/stores/me/sse/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter storeStreamMe() {
+        UUID storeId = requireAuthenticatedStoreId();
         return broadcaster.registerStore(storeId);
     }
 
@@ -61,18 +61,46 @@ public class TransactionEventController {
     public ResponseEntity<List<TxEvent>> storeRecent(
             @PathVariable("storeId") String storeIdStr,
             @RequestParam(value = "limit", defaultValue = "50") int limit) {
-        UUID storeId;
-        try { storeId = UUID.fromString(storeIdStr); }
-        catch (IllegalArgumentException e) { return ResponseEntity.badRequest().build(); }
-        Store store = storeRepository.findById(storeId).orElse(null);
-        if (store == null) return ResponseEntity.notFound().build();
-        final CurrentUser cu = auth.current();
-        if (!cu.isGlobalAdmin() && (cu.getStoreId() == null || !cu.getStoreId().equals(store.getId()))) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
-        }
+        UUID storeId = parseStoreId(storeIdStr);
+        authorizeStoreAccess(storeId);
         return ResponseEntity.ok(broadcaster.replayRecent(ev ->
                 storeId.equals(ev.storeId())
                         || storeId.equals(ev.fulfillingStoreId())
                         || storeId.equals(ev.originatingStoreId()), limit));
+    }
+
+    /** Store-scoped REST replay for the currently authenticated store. */
+    @GetMapping("/api/stores/me/sse/events/recent")
+    public ResponseEntity<List<TxEvent>> storeRecentMe(
+            @RequestParam(value = "limit", defaultValue = "50") int limit) {
+        UUID storeId = requireAuthenticatedStoreId();
+        return ResponseEntity.ok(broadcaster.replayRecent(ev ->
+                storeId.equals(ev.storeId())
+                        || storeId.equals(ev.fulfillingStoreId())
+                        || storeId.equals(ev.originatingStoreId()), limit));
+    }
+
+    private UUID parseStoreId(String storeIdStr) {
+        try { return UUID.fromString(storeIdStr); }
+        catch (IllegalArgumentException e) { throw new SecurityException("Invalid store id"); }
+    }
+
+    private UUID requireAuthenticatedStoreId() {
+        final CurrentUser cu = auth.current();
+        UUID storeId = cu.getStoreId();
+        if (storeId == null) {
+            if (cu.isGlobalAdmin()) throw new SecurityException("Global admin must use /api/admin/sse/events endpoint");
+            throw new SecurityException("This operation requires a store-scoped user.");
+        }
+        storeRepository.findById(storeId).orElseThrow(() -> new SecurityException("Store not found"));
+        return storeId;
+    }
+
+    private void authorizeStoreAccess(UUID storeId) {
+        Store store = storeRepository.findById(storeId).orElseThrow(() -> new SecurityException("Store not found"));
+        final CurrentUser cu = auth.current();
+        if (!cu.isGlobalAdmin() && (cu.getStoreId() == null || !cu.getStoreId().equals(store.getId()))) {
+            throw new SecurityException("You do not belong to this store");
+        }
     }
 }

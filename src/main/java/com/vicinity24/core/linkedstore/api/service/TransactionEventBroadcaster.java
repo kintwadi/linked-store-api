@@ -2,6 +2,7 @@ package com.vicinity24.core.linkedstore.api.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,6 +24,8 @@ public class TransactionEventBroadcaster {
 
     public static final long EMITTER_TIMEOUT_MS = 30L * 60L * 1000L;
     private static final int REPLAY_BUFFER_MAX = 200;
+    /** Terminal events (EXPIRED/CANCELED/UNAVAILABLE) older than this many minutes are omitted from replay. */
+    private static final int TERMINAL_EVENT_REPLAY_MINUTES = 10;
 
     private final ObjectMapper objectMapper;
 
@@ -65,10 +68,15 @@ public class TransactionEventBroadcaster {
                     .data("{\"ok\":true,\"label\":\"" + label + "\"}"));
         } catch (IOException ignored) {}
 
-        // Replay recent events so newly-opened admin/owner dashboards don't miss last batch of requests
+        // Replay recent events so newly-opened admin/owner dashboards don't miss last batch of requests.
+        // Stale terminal events (EXPIRED / CANCELED / UNAVAILABLE older than N minutes) are skipped so
+        // new logins do not see a long list of already-dead notifications.
         try {
+            final OffsetDateTime now = OffsetDateTime.now();
             for (TxEvent ev : replayBuffer) {
-                if (filter.test(ev)) sendSingle(emitter, ev, false);
+                if (!filter.test(ev)) continue;
+                if (isStaleTerminal(ev, now)) continue;
+                sendSingle(emitter, ev, false);
             }
         } catch (Exception ignore) {}
 
@@ -128,9 +136,12 @@ public class TransactionEventBroadcaster {
     public List<TxEvent> replayRecent(Predicate<TxEvent> filter, int limit) {
         final int max = Math.min(Math.max(1, limit), REPLAY_BUFFER_MAX);
         final List<TxEvent> out = new ArrayList<>(max);
+        final OffsetDateTime now = OffsetDateTime.now();
         for (int i = replayBuffer.size() - 1; i >= 0 && out.size() < max; i--) {
             TxEvent e = replayBuffer.get(i);
-            if (filter == null || filter.test(e)) out.add(0, e);
+            if (filter != null && !filter.test(e)) continue;
+            if (isStaleTerminal(e, now)) continue;
+            out.add(0, e);
         }
         return out;
     }
@@ -149,6 +160,30 @@ public class TransactionEventBroadcaster {
                 it.remove();
             }
         }
+    }
+
+    /** Periodically prune stale terminal events from the replay buffer so fresh dashboard loads stay clean. */
+    @Scheduled(fixedRate = 60000L)
+    public void pruneStaleTerminalFromReplayBuffer() {
+        final OffsetDateTime now = OffsetDateTime.now();
+        final int before = replayBuffer.size();
+        replayBuffer.removeIf(ev -> isStaleTerminal(ev, now));
+        final int after = replayBuffer.size();
+        if (before != after) {
+            log.debug("TxEventBroadcaster: replay buffer pruned stale terminal events: {} -> {}", before, after);
+        }
+    }
+
+    /** Returns true if the event is a terminal state and older than the allowed replay window. */
+    private boolean isStaleTerminal(TxEvent ev, OffsetDateTime now) {
+        if (ev == null) return true;
+        final TxEventType t = ev.type();
+        if (t != TxEventType.EXPIRED && t != TxEventType.CANCELLED && t != TxEventType.UNAVAILABLE) {
+            return false;
+        }
+        final OffsetDateTime createdAt = ev.createdAt();
+        if (createdAt == null) return false;
+        return createdAt.plusMinutes(TERMINAL_EVENT_REPLAY_MINUTES).isBefore(now);
     }
 
     public int activeEmitterCount() {

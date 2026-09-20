@@ -34,7 +34,17 @@ class StorePermissionGuard {
     }
 
     boolean canViewProductsOfStore(CurrentUser caller, UUID storeId) {
-        return canViewStore(caller, storeId);
+        if (caller == null || !caller.isAuthenticated()) return false;
+        if (caller.isGlobalAdmin()) return true;
+        UserRole role = caller.getRole();
+        if (role == UserRole.OWNER
+                || role == UserRole.STORE_ADMIN
+                || role == UserRole.STORE_REPRESENTATIVE
+                || role == UserRole.CLERK
+                || role == UserRole.RUNNER) {
+            return true;
+        }
+        return false;
     }
 
     boolean canCreateProduct(CurrentUser caller, UUID storeId) {
@@ -60,16 +70,12 @@ class StorePermissionGuard {
         if (caller == null || !caller.isAuthenticated()) return false;
         if (caller.isGlobalAdmin()) return true;
         UserRole role = caller.getRole();
-        if (role == UserRole.OWNER || role == UserRole.STORE_ADMIN) {
+        if (role == UserRole.OWNER
+                || role == UserRole.STORE_ADMIN
+                || role == UserRole.STORE_REPRESENTATIVE
+                || role == UserRole.CLERK
+                || role == UserRole.RUNNER) {
             return true;
-        }
-        if (role == UserRole.STORE_REPRESENTATIVE) {
-            return true;
-        }
-        if (role == UserRole.CLERK || role == UserRole.RUNNER) {
-            return caller.getStoreId() != null
-                    && productStoreId != null
-                    && caller.getStoreId().equals(productStoreId);
         }
         return false;
     }

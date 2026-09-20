@@ -142,6 +142,16 @@ public class PermissionService {
         return adminGuard.canEditStoreSettings(caller, storeId);
     }
 
+    public boolean canManageStoreRequests(CurrentUser caller, UUID storeId) {
+        return adminGuard.canManageStoreRequests(caller, storeId);
+    }
+
+    public void ensureCanManageStoreRequests(CurrentUser caller, UUID storeId) {
+        if (!canManageStoreRequests(caller, storeId)) {
+            throw new PermissionDeniedException("manage-store-requests", storeId, "ILLEGAL_STORE_REQUEST_MANAGE");
+        }
+    }
+
     public void ensureCanEditStoreSettings(CurrentUser caller, UUID storeId) {
         if (!canEditStoreSettings(caller, storeId)) {
             throw new PermissionDeniedException("edit-store-settings", storeId, "ILLEGAL_STORE_SETTINGS_EDIT");

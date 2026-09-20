@@ -2,6 +2,8 @@ package com.vicinity24.core.linkedstore.api.service;
 
 import com.stripe.exception.StripeException;
 import com.stripe.model.PaymentIntent;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.dto.VerifyPickupRequest;
 import com.vicinity24.core.linkedstore.api.dto.VerifyPickupResponse;
 import com.vicinity24.core.linkedstore.api.entity.*;
@@ -9,15 +11,20 @@ import com.vicinity24.core.linkedstore.api.exception.InvalidQrTokenException;
 import com.vicinity24.core.linkedstore.api.exception.ResourceNotFoundException;
 import com.vicinity24.core.linkedstore.api.exception.RoleNotAuthorizedException;
 import com.vicinity24.core.linkedstore.api.exception.TransactionStateException;
+import com.vicinity24.core.linkedstore.api.repository.InventoryLockRepository;
+import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreUserRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.Set;
@@ -31,9 +38,13 @@ public class FulfillmentService {
     private final QrTokenRepository qrTokenRepository;
     private final StoreUserRepository storeUserRepository;
     private final TransactionRepository transactionRepository;
+    private final ProductVariantRepository productVariantRepository;
+    private final InventoryLockRepository inventoryLockRepository;
+    private final TransactionEventBroadcaster eventBroadcaster;
 
     private static final Set<StoreUserRole> FULFILLMENT_SCAN_ROLES =
-            Set.of(StoreUserRole.OWNER, StoreUserRole.CLERK);
+            Set.of(StoreUserRole.OWNER, StoreUserRole.STORE_ADMIN,
+                    StoreUserRole.STORE_REPRESENTATIVE, StoreUserRole.CLERK);
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public VerifyPickupResponse verifyPickup(VerifyPickupRequest request) {
@@ -160,6 +171,59 @@ public class FulfillmentService {
 
         log.info("Pickup verified successfully: tx={}, qr={}, scannedBy={}, scannedAt={}",
                 transactionId, qrToken.getId(), scanningUserId, now);
+
+        try {
+            UUID variantId = inventoryLockRepository.findByTransactionId(transactionId).stream()
+                    .findFirst()
+                    .map(InventoryLock::getVariantId)
+                    .orElse(null);
+            String sku = null;
+            UUID productId = null;
+            String productTitle = null;
+            String productImageUrl = null;
+            BigDecimal price = null;
+            if (variantId != null) {
+                Optional<ProductVariant> vOpt = productVariantRepository.findByIdWithProduct(variantId);
+                if (vOpt.isPresent()) {
+                    ProductVariant v = vOpt.get();
+                    sku = v.getSku();
+                    productId = v.getProductId();
+                    if (v.getImageUrl() != null && !v.getImageUrl().isBlank()) productImageUrl = v.getImageUrl();
+                    if (v.getProduct() != null) {
+                        productTitle = v.getProduct().getTitle();
+                        if ((productImageUrl == null || productImageUrl.isBlank())
+                                && v.getProduct().getPrimaryImageUrl() != null) {
+                            productImageUrl = v.getProduct().getPrimaryImageUrl();
+                        }
+                    }
+                    if (v.getRetailPriceCents() != null) {
+                        price = BigDecimal.valueOf(v.getRetailPriceCents()).setScale(2, RoundingMode.UNNECESSARY)
+                                .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY);
+                    }
+                }
+            }
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.PICKED_UP)
+                    .createdAt(now)
+                    .transactionId(transactionId)
+                    .storeId(fulfillingStoreId)
+                    .fulfillingStoreId(fulfillingStoreId)
+                    .originatingStoreId(transaction.getOriginatingStoreId())
+                    .variantId(variantId)
+                    .productId(productId)
+                    .productTitle(productTitle)
+                    .productImageUrl(productImageUrl)
+                    .sku(sku)
+                    .retailPrice(price)
+                    .currency("USD")
+                    .status(TransactionStatus.PICKED_UP.name())
+                    .runnerId(qrToken.getRunnerId() != null ? qrToken.getRunnerId().toString() : null)
+                    .qrFallbackCode(qrToken.getFallbackCode())
+                    .message("Runner picked up item from fulfilling store. custody verified.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("FulfillmentService: broadcast PICKED_UP failed txId={}", transactionId, ex);
+        }
 
         return VerifyPickupResponse.builder()
                 .transactionId(transactionId)

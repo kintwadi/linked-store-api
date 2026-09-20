@@ -28,6 +28,8 @@ public class StoreInventoryListingResponse {
 
     private UUID storeId;
 
+    private String storeName;
+
     private String sku;
 
     private Integer wholesalePriceCents;

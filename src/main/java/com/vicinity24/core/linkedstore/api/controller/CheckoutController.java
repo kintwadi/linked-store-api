@@ -78,7 +78,9 @@ public class CheckoutController {
                     .build());
         }
 
-        if (tx.getStatus() != TransactionStatus.RESERVED
+        if (tx.getStatus() != TransactionStatus.PENDING_RESERVATION
+                && tx.getStatus() != TransactionStatus.RESERVED
+                && tx.getStatus() != TransactionStatus.READY
                 && tx.getStatus() != TransactionStatus.PAID
                 && tx.getStatus() != TransactionStatus.PICKED_UP) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(CheckoutSessionResponse.builder()
@@ -95,14 +97,9 @@ public class CheckoutController {
                     .build());
         }
 
-        if (fulfillingStore.getStripeConnectId() == null
+        final boolean storeNotOnboarded = fulfillingStore.getStripeConnectId() == null
                 || fulfillingStore.getStripeConnectId().isBlank()
-                || fulfillingStore.getStripeConnectId().startsWith("acct_connected_")) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(CheckoutSessionResponse.builder()
-                    .status("error")
-                    .message("Fulfilling store has not yet onboarded Stripe Connect. Cannot process split-ledger payment.")
-                    .build());
-        }
+                || fulfillingStore.getStripeConnectId().startsWith("acct_connected_");
 
         UUID variantId = null;
         final List<InventoryLock> locks = inventoryLockRepository.findByTransactionId(tx.getId());
@@ -141,6 +138,63 @@ public class CheckoutController {
                 ? product.getTitle()
                 : (request.getTitle() != null ? request.getTitle() : "Linked-Store Purchase");
 
+        if (storeNotOnboarded) {
+            try {
+                final List<String> imagesFb = new ArrayList<>();
+                if (imageUrl != null && !imageUrl.isBlank()) imagesFb.add(imageUrl);
+                final Map<String, Object> productDataFb = new HashMap<>();
+                productDataFb.put("name", productTitle);
+                if (!imagesFb.isEmpty()) productDataFb.put("images", imagesFb);
+                final Map<String, Object> priceDataFb = new HashMap<>();
+                priceDataFb.put("currency", "usd");
+                priceDataFb.put("unit_amount", tx.getTotalRetailCents());
+                priceDataFb.put("product_data", productDataFb);
+                final Map<String, Object> lineItemFb = new HashMap<>();
+                lineItemFb.put("quantity", 1L);
+                lineItemFb.put("price_data", priceDataFb);
+                final List<Object> lineItemsFb = new ArrayList<>();
+                lineItemsFb.add(lineItemFb);
+
+                final Map<String, String> metaFb = new HashMap<>();
+                metaFb.put("transactionId", tx.getId().toString());
+                metaFb.put("fulfillingConnectId", fulfillingStore.getStripeConnectId() != null ? fulfillingStore.getStripeConnectId() : "");
+                metaFb.put("originatingConnectId",
+                        storeRepository.findById(tx.getOriginatingStoreId())
+                                .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "").orElse(""));
+                metaFb.put("wholesalePayoutCents", String.valueOf(tx.getWholesalePayoutCents()));
+                metaFb.put("arbitrageMarginCents", String.valueOf(tx.getArbitrageMarginCents()));
+                metaFb.put("splitFallback", "store-not-onboarded; explicit Transfers will reconcile after custody.");
+
+                final Map<String, Object> paramsFb = new HashMap<>();
+                paramsFb.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
+                paramsFb.put("success_url", request.getSuccessUrl());
+                paramsFb.put("cancel_url", request.getCancelUrl());
+                paramsFb.put("line_items", lineItemsFb);
+                paramsFb.put("allow_promotion_codes", Boolean.TRUE);
+                paramsFb.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
+                paramsFb.put("metadata", metaFb);
+                if (request.getCustomerEmail() != null && !request.getCustomerEmail().isBlank()) {
+                    paramsFb.put("customer_email", request.getCustomerEmail());
+                }
+
+                final Session fallback = Session.create(paramsFb);
+                return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
+                        .id(fallback.getId())
+                        .url(fallback.getUrl())
+                        .status("ok_fallback_split")
+                        .message("Fallback: fulfilling store has not yet onboarded Stripe Connect. " +
+                                "Platform will issue explicit wholesale + margin transfers after custody proof.")
+                        .build());
+            } catch (StripeException fbEx) {
+                log.error("Fallback (not-onboarded) checkout also failed for tx={}", request.getTransactionId(), fbEx);
+                final String msg = fbEx.getUserMessage() != null ? fbEx.getUserMessage() : fbEx.getMessage();
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message(msg)
+                        .build());
+            }
+        }
+
         try {
             final List<String> images = new ArrayList<>();
             if (imageUrl != null && !imageUrl.isBlank()) {
@@ -170,8 +224,14 @@ public class CheckoutController {
             transferData.put("amount", tx.getWholesalePayoutCents());
 
             final Map<String, Object> paymentIntentData = new HashMap<>();
-            paymentIntentData.put("application_fee_amount", 0L);
             paymentIntentData.put("transfer_data", transferData);
+
+            final long platformFeeCents = tx.getTotalRetailCents()
+                    - tx.getWholesalePayoutCents()
+                    - (tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0L);
+            if (platformFeeCents > 0) {
+                paymentIntentData.put("application_fee_amount", platformFeeCents);
+            }
 
             final Map<String, String> metadata = new HashMap<>();
             metadata.put("transactionId", tx.getId().toString());
