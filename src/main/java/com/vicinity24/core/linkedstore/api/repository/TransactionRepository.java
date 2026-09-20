@@ -24,6 +24,10 @@ public interface TransactionRepository extends JpaRepository<Transaction, UUID>,
 
     List<Transaction> findByStatus(TransactionStatus status);
 
+    List<Transaction> findByRunnerIdAndStatus(UUID runnerId, TransactionStatus status);
+
+    List<Transaction> findByRunnerId(UUID runnerId);
+
     @Query("""
         SELECT t FROM Transaction t
         WHERE (t.originatingStoreId = :storeId OR t.fulfillingStoreId = :storeId)

@@ -46,7 +46,8 @@ public class AdminTransactionController {
             @RequestParam(name = "page", defaultValue = "0") int page,
             @RequestParam(name = "pageSize", defaultValue = "25") int pageSize,
             @RequestParam(name = "storeId", required = false) UUID storeId,
-            @RequestParam(name = "status", required = false) String status) {
+            @RequestParam(name = "status", required = false) String status,
+            @RequestParam(name = "runnerId", required = false) UUID runnerId) {
 
         if (page < 0) page = 0;
         if (pageSize <= 0) pageSize = 25;
@@ -57,9 +58,70 @@ public class AdminTransactionController {
 
         Pageable pageable = PageRequest.of(page, pageSize, Sort.by(Sort.Direction.DESC, "createdAt"));
 
-        Specification<Transaction> spec = buildFilterSpec(current, storeId, status);
+        Specification<Transaction> spec = buildFilterSpec(current, storeId, status, runnerId);
 
         Page<Transaction> txPage = transactionRepository.findAll(spec, pageable);
+
+        List<TransactionResponse> itemList = new ArrayList<>();
+        for (Transaction tx : txPage.getContent()) {
+            itemList.add(buildTransactionResponse(tx));
+        }
+
+        AdminTransactionListResponse response = AdminTransactionListResponse.builder()
+                .items(itemList)
+                .page(txPage.getNumber())
+                .pageSize(txPage.getSize())
+                .totalCount(txPage.getTotalElements())
+                .totalElements(txPage.getTotalElements())
+                .totalPages(txPage.getTotalPages())
+                .hasNext(txPage.hasNext())
+                .hasPrevious(txPage.hasPrevious())
+                .build();
+
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/me/runner")
+    public ResponseEntity<?> listRunnerPickups(
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "pageSize", defaultValue = "25") int pageSize,
+            @RequestParam(name = "status", required = false, defaultValue = "PAID") String status) {
+
+        if (page < 0) page = 0;
+        if (pageSize <= 0) pageSize = 25;
+        if (pageSize > 200) pageSize = 200;
+
+        CurrentUser current = authenticationFacade.current();
+        if (!current.isAuthenticated()) {
+            return ResponseEntity.status(401).build();
+        }
+
+        UUID runnerUserId = current.getUserId();
+        if (runnerUserId == null) {
+            return ResponseEntity.status(400).body("Runner user id missing in token.");
+        }
+
+        Pageable pageable = PageRequest.of(page, pageSize, Sort.by(Sort.Direction.DESC, "createdAt"));
+
+        TransactionStatus requestedStatus;
+        try {
+            requestedStatus = status != null && !status.isBlank()
+                    ? TransactionStatus.valueOf(status)
+                    : TransactionStatus.PAID;
+        } catch (IllegalArgumentException iae) {
+            requestedStatus = TransactionStatus.PAID;
+        }
+        final TransactionStatus finalStatus = requestedStatus;
+        final UUID finalRunnerUserId = runnerUserId;
+
+        Specification<Transaction> runnerSpec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            predicates.add(cb.equal(root.get("runnerId"), finalRunnerUserId));
+            predicates.add(cb.equal(root.get("status"), finalStatus));
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+
+        Page<Transaction> txPage = transactionRepository.findAll(runnerSpec, pageable);
 
         List<TransactionResponse> itemList = new ArrayList<>();
         for (Transaction tx : txPage.getContent()) {
@@ -83,7 +145,8 @@ public class AdminTransactionController {
     private Specification<Transaction> buildFilterSpec(
             CurrentUser current,
             UUID storeIdFilter,
-            String statusFilter) {
+            String statusFilter,
+            UUID runnerIdFilter) {
 
         Specification<Transaction> scopeSpec = adminScopingService.visibleTransactionIds(current);
 
@@ -100,6 +163,10 @@ public class AdminTransactionController {
 
             if (statusFilter != null && !statusFilter.isBlank()) {
                 predicates.add(cb.equal(root.get("status"), TransactionStatus.valueOf(statusFilter)));
+            }
+
+            if (runnerIdFilter != null) {
+                predicates.add(cb.equal(root.get("runnerId"), runnerIdFilter));
             }
 
             return cb.and(predicates.toArray(new Predicate[0]));
