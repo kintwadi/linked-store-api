@@ -140,7 +140,18 @@ public class CheckoutService {
                     paymentProvider.providerId(), transactionId, paymentIntent.getPaymentIntentId(), e);
         }
 
-        UUID runnerId = assignRunnerForOriginatingStore(originatingStore.getId());
+        // Runner: if the reservation flow already assigned one, reuse it.
+        // Otherwise prefer fulfilling store runners (pickup happens there), else originating
+        // store. If exactly one runner exists in the fulfilling store and runner was null,
+        // auto-assign them to unblock the runner queue.
+        UUID runnerId = transaction.getRunnerId();
+        if (runnerId == null) {
+            runnerId = assignRunnerForPickup(originatingStore.getId(), fulfillingStore.getId());
+            if (runnerId != null) {
+                transaction.setRunnerId(runnerId);
+                transaction = transactionRepository.save(transaction);
+            }
+        }
 
         String secureToken = generateSecureToken(transactionId, runnerId, now);
         String fallbackCode = generateFallbackCode();
@@ -292,42 +303,38 @@ public class CheckoutService {
                 provider.providerId(), transferGroup, wholesalePayoutCents, marginCents);
     }
 
+    /**
+     * Pick a runner for handoff. Pickup happens at the FULFILLING store so we always prefer
+     * the fulfilling store's RUNNER users first, then fall back to originating store or other
+     * roles.
+     */
+    private UUID assignRunnerForPickup(UUID originatingStoreId, UUID fulfillingStoreId) {
+        UUID[] order = new UUID[]{fulfillingStoreId, originatingStoreId};
+        for (UUID storeId : order) {
+            if (storeId == null) continue;
+            List<StoreUser> runners = storeUserRepository.findByStoreIdAndRole(storeId, StoreUserRole.RUNNER);
+            if (!runners.isEmpty()) return runners.get(0).getId();
+        }
+        for (UUID storeId : order) {
+            if (storeId == null) continue;
+            List<StoreUser> owners = storeUserRepository.findByStoreIdAndRole(storeId, StoreUserRole.OWNER);
+            if (!owners.isEmpty()) return owners.get(0).getId();
+            List<StoreUser> admins = storeUserRepository.findByStoreIdAndRole(storeId, StoreUserRole.STORE_ADMIN);
+            if (!admins.isEmpty()) return admins.get(0).getId();
+            List<StoreUser> reps = storeUserRepository.findByStoreIdAndRole(storeId, StoreUserRole.STORE_REPRESENTATIVE);
+            if (!reps.isEmpty()) return reps.get(0).getId();
+            List<StoreUser> clerks = storeUserRepository.findByStoreIdAndRole(storeId, StoreUserRole.CLERK);
+            if (!clerks.isEmpty()) return clerks.get(0).getId();
+            List<StoreUser> fallback = storeUserRepository.findByStoreId(storeId);
+            if (!fallback.isEmpty()) return fallback.get(0).getId();
+        }
+        return null;
+    }
+
     private UUID assignRunnerForOriginatingStore(UUID originatingStoreId) {
-        List<StoreUser> runners = storeUserRepository.findByStoreIdAndRole(
-                originatingStoreId, StoreUserRole.RUNNER);
-        if (!runners.isEmpty()) {
-            return runners.get(0).getId();
-        }
-
-        List<StoreUser> owners = storeUserRepository.findByStoreIdAndRole(
-                originatingStoreId, StoreUserRole.OWNER);
-        if (!owners.isEmpty()) {
-            return owners.get(0).getId();
-        }
-
-        List<StoreUser> storeAdmins = storeUserRepository.findByStoreIdAndRole(
-                originatingStoreId, StoreUserRole.STORE_ADMIN);
-        if (!storeAdmins.isEmpty()) {
-            return storeAdmins.get(0).getId();
-        }
-
-        List<StoreUser> representatives = storeUserRepository.findByStoreIdAndRole(
-                originatingStoreId, StoreUserRole.STORE_REPRESENTATIVE);
-        if (!representatives.isEmpty()) {
-            return representatives.get(0).getId();
-        }
-
-        List<StoreUser> clerks = storeUserRepository.findByStoreIdAndRole(
-                originatingStoreId, StoreUserRole.CLERK);
-        if (!clerks.isEmpty()) {
-            return clerks.get(0).getId();
-        }
-
-        List<StoreUser> fallback = storeUserRepository.findByStoreId(originatingStoreId);
-        if (fallback.isEmpty()) {
-            throw new ResourceNotFoundException("StoreUser for Store", originatingStoreId.toString());
-        }
-        return fallback.get(0).getId();
+        UUID r = assignRunnerForPickup(originatingStoreId, null);
+        if (r != null) return r;
+        throw new ResourceNotFoundException("StoreUser for Store", originatingStoreId.toString());
     }
 
     private String generateSecureToken(UUID transactionId, UUID runnerId, OffsetDateTime timestamp) {

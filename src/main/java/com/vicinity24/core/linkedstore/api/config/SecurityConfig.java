@@ -77,10 +77,10 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/api/admin/stores").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/api/admin/stores/**").hasRole("GLOBAL_ADMIN")
-                .requestMatchers("/api/admin/transactions/me/runner").hasAnyRole(
+                .requestMatchers("/api/admin/transactions/me/runner", "/api/admin/transactions/me/runner/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/api/admin/transactions/**").hasAnyRole(
-                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE")
+                        "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
                 .requestMatchers("/api/admin/users/**").hasAnyRole(
                         "GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
                 .requestMatchers("/api/connect/**").hasAnyRole("GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")

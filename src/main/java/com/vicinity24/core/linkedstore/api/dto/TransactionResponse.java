@@ -34,4 +34,8 @@ public class TransactionResponse {
     private String qrFallbackCode;
     private String createdAt;
     private String updatedAt;
+    private UUID runnerId;
+    private Integer perspectivePriceCents;
+    private String perspectiveRole;
+    private UUID perspectiveStoreId;
 }

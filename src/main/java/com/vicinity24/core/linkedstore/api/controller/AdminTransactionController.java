@@ -20,10 +20,9 @@ import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 @Slf4j
 @RestController
@@ -33,6 +32,7 @@ public class AdminTransactionController {
 
     private final TransactionRepository transactionRepository;
     private final StoreRepository storeRepository;
+    private final StoreUserRepository storeUserRepository;
     private final InventoryLockRepository inventoryLockRepository;
     private final TransactionItemRepository transactionItemRepository;
     private final ProductVariantRepository productVariantRepository;
@@ -64,7 +64,7 @@ public class AdminTransactionController {
 
         List<TransactionResponse> itemList = new ArrayList<>();
         for (Transaction tx : txPage.getContent()) {
-            itemList.add(buildTransactionResponse(tx));
+            itemList.add(buildTransactionResponse(tx, current));
         }
 
         AdminTransactionListResponse response = AdminTransactionListResponse.builder()
@@ -101,7 +101,13 @@ public class AdminTransactionController {
             return ResponseEntity.status(400).body("Runner user id missing in token.");
         }
 
-        Pageable pageable = PageRequest.of(page, pageSize, Sort.by(Sort.Direction.DESC, "createdAt"));
+        Set<UUID> myStoreIds = adminScopingService.visibleStoreIds(current);
+        if (myStoreIds == null) {
+            // global admin: do not filter by stores
+            myStoreIds = Collections.emptySet();
+        }
+
+        final boolean globalAdmin = current.isGlobalAdmin();
 
         TransactionStatus requestedStatus;
         try {
@@ -113,19 +119,46 @@ public class AdminTransactionController {
         }
         final TransactionStatus finalStatus = requestedStatus;
         final UUID finalRunnerUserId = runnerUserId;
+        final Set<UUID> finalStoreIds = myStoreIds;
 
+        // A runner sees rows that are either (a) explicitly assigned to me OR
+        // (b) rows whose fulfilling store is one of my stores AND status is an
+        //     operational pickup status (READY / PAID / PICKED_UP) regardless of
+        //     current runner assignment (so a runner can claim unassigned work).
+        // Global admins additionally see all rows without store restriction.
         Specification<Transaction> runnerSpec = (root, query, cb) -> {
             List<Predicate> predicates = new ArrayList<>();
-            predicates.add(cb.equal(root.get("runnerId"), finalRunnerUserId));
+
             predicates.add(cb.equal(root.get("status"), finalStatus));
+
+            Predicate assignedToMe = cb.equal(root.get("runnerId"), finalRunnerUserId);
+
+            final Set<UUID> stores = finalStoreIds == null ? Collections.emptySet() : finalStoreIds;
+            final boolean storeScoped = !stores.isEmpty();
+
+            Predicate unassignedOrAssignedInMyStore;
+            if (globalAdmin) {
+                // Admin sees any row of the given status
+                unassignedOrAssignedInMyStore = cb.conjunction();
+            } else if (storeScoped) {
+                Predicate fulfillingInStores = root.get("fulfillingStoreId").in(stores);
+                unassignedOrAssignedInMyStore = fulfillingInStores;
+            } else {
+                // No stores (no scope): see only rows explicitly assigned to me
+                unassignedOrAssignedInMyStore = assignedToMe;
+            }
+
+            predicates.add(cb.or(assignedToMe, unassignedOrAssignedInMyStore));
+
             return cb.and(predicates.toArray(new Predicate[0]));
         };
 
+        Pageable pageable = PageRequest.of(page, pageSize, Sort.by(Sort.Direction.DESC, "createdAt"));
         Page<Transaction> txPage = transactionRepository.findAll(runnerSpec, pageable);
 
         List<TransactionResponse> itemList = new ArrayList<>();
         for (Transaction tx : txPage.getContent()) {
-            itemList.add(buildTransactionResponse(tx));
+            itemList.add(buildTransactionResponse(tx, current));
         }
 
         AdminTransactionListResponse response = AdminTransactionListResponse.builder()
@@ -140,6 +173,98 @@ public class AdminTransactionController {
                 .build();
 
         return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Runner self-claim endpoint. Assigns transaction.runnerId = current user if status is
+     * READY / PAID / PICKED_UP and either runnerId null, or runnerId already me. Otherwise
+     * (already assigned to someone else) returns 409.
+     */
+    @PostMapping("/me/runner/claim/{transactionId}")
+    public ResponseEntity<?> claimRunner(@PathVariable UUID transactionId) {
+        CurrentUser current = authenticationFacade.current();
+        if (!current.isAuthenticated() || current.getUserId() == null) {
+            return ResponseEntity.status(401).build();
+        }
+        final UUID me = current.getUserId();
+        final boolean globalAdmin = current.isGlobalAdmin();
+        final Set<UUID> myStoreIds = adminScopingService.visibleStoreIds(current);
+
+        Optional<Transaction> opt = transactionRepository.findById(transactionId);
+        if (opt.isEmpty()) return ResponseEntity.status(404).body("Transaction not found.");
+        Transaction tx = opt.get();
+
+        Set<UUID> stores = myStoreIds != null ? myStoreIds : Collections.emptySet();
+        boolean canSee = globalAdmin || (stores.isEmpty() ? false : stores.contains(tx.getFulfillingStoreId()));
+        if (!canSee) return ResponseEntity.status(403).body("Not allowed to claim items outside your stores.");
+
+        TransactionStatus s = tx.getStatus();
+        if (s != TransactionStatus.READY && s != TransactionStatus.PAID && s != TransactionStatus.PICKED_UP) {
+            return ResponseEntity.badRequest().body("Can only claim READY/PAID/PICKED_UP transactions, current status=" + s);
+        }
+
+        UUID existingRunner = tx.getRunnerId();
+        if (existingRunner != null && !existingRunner.equals(me)) {
+            // If the runner is from a different store entirely, reject: another runner already claimed.
+            return ResponseEntity.status(409).body("Transaction already assigned to another runner (" + existingRunner + ").");
+        }
+
+        tx.setRunnerId(me);
+        tx = transactionRepository.save(tx);
+        return ResponseEntity.ok(Map.of(
+                "ok", true,
+                "runnerId", me.toString(),
+                "transactionId", tx.getId().toString(),
+                "status", tx.getStatus().name()
+        ));
+    }
+
+    /** Admin assign: STORE_ADMIN or higher can explicitly assign a runner for a transaction. */
+    @PostMapping("/{transactionId}/assign-runner")
+    public ResponseEntity<?> assignRunner(
+            @PathVariable UUID transactionId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        authenticationFacade.requireAtLeastRole(UserRole.STORE_ADMIN);
+        CurrentUser current = authenticationFacade.current();
+        Optional<Transaction> opt = transactionRepository.findById(transactionId);
+        if (opt.isEmpty()) return ResponseEntity.status(404).body("Transaction not found.");
+        Transaction tx = opt.get();
+
+        Set<UUID> stores = adminScopingService.visibleStoreIds(current);
+        if (stores != null && !stores.isEmpty() && !stores.contains(tx.getFulfillingStoreId())) {
+            return ResponseEntity.status(403).body("Not allowed to manage items outside your stores.");
+        }
+
+        UUID runnerId = null;
+        if (body != null) {
+            Object rid = body.get("runnerId");
+            if (rid instanceof String s && !s.isBlank()) {
+                try { runnerId = UUID.fromString(s); } catch (IllegalArgumentException ignored) {}
+            } else if (rid instanceof UUID u) {
+                runnerId = u;
+            }
+        }
+        if (runnerId == null) {
+            return ResponseEntity.badRequest().body("runnerId is required in JSON body { runnerId: <uuid> }.");
+        }
+
+        Optional<StoreUser> runner = storeUserRepository.findByIdAndRole(runnerId, StoreUserRole.RUNNER);
+        if (runner.isEmpty()) {
+            return ResponseEntity.badRequest().body("runnerId is not a RUNNER user.");
+        }
+        StoreUser ru = runner.get();
+        if (stores != null && !stores.isEmpty() && ru.getStoreId() != null && !stores.contains(ru.getStoreId())) {
+            return ResponseEntity.badRequest().body("Runner is not part of your store.");
+        }
+
+        tx.setRunnerId(runnerId);
+        tx = transactionRepository.save(tx);
+        return ResponseEntity.ok(Map.of(
+                "ok", true,
+                "runnerId", runnerId.toString(),
+                "transactionId", tx.getId().toString(),
+                "status", tx.getStatus().name()
+        ));
     }
 
     private Specification<Transaction> buildFilterSpec(
@@ -173,7 +298,7 @@ public class AdminTransactionController {
         };
     }
 
-    private TransactionResponse buildTransactionResponse(Transaction tx) {
+    private TransactionResponse buildTransactionResponse(Transaction tx, CurrentUser current) {
         UUID txId = tx.getId();
 
         String originatingStoreName = storeRepository.findById(tx.getOriginatingStoreId())
@@ -233,6 +358,34 @@ public class AdminTransactionController {
         String qrSecureToken = qrToken != null ? qrToken.getSecureToken() : null;
         String qrFallbackCode = qrToken != null ? qrToken.getFallbackCode() : null;
 
+        UUID myStoreId = null;
+        if (current != null && !current.isGlobalAdmin()) {
+            myStoreId = current.getStoreId();
+            Set<UUID> scope = adminScopingService.visibleStoreIds(current);
+            if (scope != null && scope.size() == 1) {
+                myStoreId = scope.iterator().next();
+            }
+        }
+
+        String perspectiveRole = "NETWORK";
+        UUID perspectiveStoreId = null;
+        int perspectivePriceCents = tx.getTotalRetailCents();
+
+        if (myStoreId != null) {
+            if (myStoreId.equals(tx.getOriginatingStoreId())) {
+                perspectiveRole = "RETAIL_HOST";
+                perspectiveStoreId = tx.getOriginatingStoreId();
+                perspectivePriceCents = tx.getTotalRetailCents();
+            } else if (myStoreId.equals(tx.getFulfillingStoreId())) {
+                perspectiveRole = "WHOLESALE_SELLER";
+                perspectiveStoreId = tx.getFulfillingStoreId();
+                perspectivePriceCents = tx.getWholesalePayoutCents();
+            } else {
+                perspectiveRole = "NETWORK";
+                perspectivePriceCents = tx.getTotalRetailCents();
+            }
+        }
+
         return TransactionResponse.builder()
                 .id(tx.getId())
                 .status(tx.getStatus().name())
@@ -255,6 +408,10 @@ public class AdminTransactionController {
                 .qrFallbackCode(qrFallbackCode)
                 .createdAt(tx.getCreatedAt() != null ? tx.getCreatedAt().toString() : null)
                 .updatedAt(tx.getUpdatedAt() != null ? tx.getUpdatedAt().toString() : null)
+                .runnerId(tx.getRunnerId())
+                .perspectivePriceCents(perspectivePriceCents)
+                .perspectiveRole(perspectiveRole)
+                .perspectiveStoreId(perspectiveStoreId)
                 .build();
     }
 }

@@ -165,7 +165,7 @@ public class ReservationController {
                 .build();
         inventoryLockRepository.save(lock);
 
-        UUID runnerId = assignRunnerForOriginatingStoreInline(originatingStoreId);
+        UUID runnerId = assignRunnerForOriginatingStoreInline(originatingStoreId, variant.getStoreId());
         tx.setRunnerId(runnerId);
         tx = transactionRepository.save(tx);
 
@@ -239,7 +239,17 @@ public class ReservationController {
                 .build());
     }
 
-    private UUID assignRunnerForOriginatingStoreInline(UUID originatingStoreId) {
+    private UUID assignRunnerForOriginatingStoreInline(UUID originatingStoreId, UUID fulfillingStoreId) {
+        // Runner picks up from FULFILLING store. So we prefer runners belonging to the
+        // fulfilling store (they're present at pickup location). Only fall back to
+        // originating store runners / other roles if the fulfilling store has no runners.
+        if (fulfillingStoreId != null) {
+            List<StoreUser> fulfillRunners = storeUserRepository.findByStoreIdAndRole(
+                    fulfillingStoreId, StoreUserRole.RUNNER);
+            if (!fulfillRunners.isEmpty()) {
+                return fulfillRunners.get(0).getId();
+            }
+        }
         List<StoreUser> runners = storeUserRepository.findByStoreIdAndRole(
                 originatingStoreId, StoreUserRole.RUNNER);
         if (!runners.isEmpty()) {
