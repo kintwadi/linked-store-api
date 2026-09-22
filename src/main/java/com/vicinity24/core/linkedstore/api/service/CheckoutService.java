@@ -368,6 +368,147 @@ public class CheckoutService {
         return String.format("%08d", nano);
     }
 
+    @Transactional
+    public void finalizeTransactionPaidAfterStripe(UUID transactionId, String paymentIntentId, boolean doExplicitPayouts) {
+        final Transaction tx = transactionRepository.findById(transactionId).orElse(null);
+        if (tx == null) {
+            log.warn("finalizePaidAfterStripe: tx {} not found, skipping", transactionId);
+            return;
+        }
+        if (tx.getStatus() != TransactionStatus.PAID && tx.getStatus() != TransactionStatus.PICKED_UP) {
+            tx.setStatus(TransactionStatus.PAID);
+        }
+        if ((tx.getStripePaymentIntentId() == null || tx.getStripePaymentIntentId().isBlank()) && paymentIntentId != null && !paymentIntentId.isBlank()) {
+            tx.setStripePaymentIntentId(paymentIntentId);
+            transactionRepository.save(tx);
+        } else if (tx.getStatus() == TransactionStatus.PAID) {
+            transactionRepository.save(tx);
+        }
+
+        final OffsetDateTime now = OffsetDateTime.now();
+        final List<InventoryLock> locks = inventoryLockRepository.findByTransactionId(transactionId);
+        for (InventoryLock lock : locks) {
+            if (lock.getStatus() == InventoryLockStatus.HELD) {
+                inventoryLockRepository.updateStatusIfCurrentStatusIs(
+                        lock.getId(), InventoryLockStatus.RELEASED_TO_SALE, InventoryLockStatus.HELD);
+            }
+        }
+
+        final UUID origStoreId = tx.getOriginatingStoreId();
+        final UUID fulfillStoreId = tx.getFulfillingStoreId();
+        final Store originatingStore = origStoreId != null ? storeRepository.findById(origStoreId).orElse(null) : null;
+        final Store fulfillingStore = fulfillStoreId != null ? storeRepository.findById(fulfillStoreId).orElse(null) : null;
+
+        if (doExplicitPayouts && originatingStore != null && fulfillingStore != null) {
+            try {
+                final String transferGroup = "tx_" + transactionId.toString().replace("-", "");
+                final int wholesale = tx.getWholesalePayoutCents() != null ? tx.getWholesalePayoutCents() : 0;
+                final int margin = tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0;
+                executeSplitLedgerPayouts(
+                        paymentProviderFactory.defaultProvider(),
+                        transferGroup,
+                        wholesale,
+                        margin,
+                        originatingStore.getStripeConnectId(),
+                        fulfillingStore.getStripeConnectId());
+            } catch (Exception ex) {
+                log.error("finalizePaidAfterStripe: explicit split payouts failed tx={}", transactionId, ex);
+            }
+        }
+
+        UUID runnerId = tx.getRunnerId();
+        if (runnerId == null && originatingStore != null && fulfillingStore != null) {
+            runnerId = assignRunnerForPickup(originatingStore.getId(), fulfillingStore.getId());
+            if (runnerId != null) {
+                tx.setRunnerId(runnerId);
+                transactionRepository.save(tx);
+            }
+        }
+
+        final Optional<QrToken> existingQr = qrTokenRepository.findByTransactionId(transactionId);
+        QrToken qrToken;
+        if (existingQr != null && existingQr.isPresent()) {
+            qrToken = existingQr.get();
+        } else {
+            final UUID finalRunnerId = runnerId;
+            final String secureToken = generateSecureToken(transactionId, finalRunnerId, now);
+            final String fallbackCode = generateFallbackCode();
+            final OffsetDateTime qrExpiresAt = now.plusMinutes(QR_TOKEN_TTL_MINUTES);
+            qrToken = QrToken.builder()
+                    .transactionId(transactionId)
+                    .runnerId(finalRunnerId)
+                    .secureToken(secureToken)
+                    .fallbackCode(fallbackCode)
+                    .expiresAt(qrExpiresAt)
+                    .build();
+            qrToken = qrTokenRepository.save(qrToken);
+        }
+
+        UUID variantId = null;
+        if (!locks.isEmpty()) variantId = locks.get(0).getVariantId();
+        else {
+            final List<TransactionItem> items = transactionItemRepository.findByTransactionId(transactionId);
+            if (!items.isEmpty()) variantId = items.get(0).getVariantId();
+        }
+        if (variantId == null) {
+            log.info("finalizePaidAfterStripe: tx {} no variant/item info, skipping SSE broadcast", transactionId);
+            return;
+        }
+        final UUID pvId = variantId;
+        final QrToken finalQrToken = qrToken;
+        final UUID finalRunnerId2 = runnerId;
+        try {
+            String sku = null;
+            String productTitle = null;
+            String productImageUrl = null;
+            UUID productId = null;
+            final Optional<ProductVariant> vOpt = productVariantRepository.findByIdWithProduct(pvId);
+            if (vOpt.isPresent()) {
+                final ProductVariant v = vOpt.get();
+                sku = v.getSku();
+                productId = v.getProductId();
+                if (v.getImageUrl() != null && !v.getImageUrl().isBlank()) productImageUrl = v.getImageUrl();
+                if (v.getProduct() != null) {
+                    productTitle = v.getProduct().getTitle();
+                    if ((productImageUrl == null || productImageUrl.isBlank())
+                            && v.getProduct().getPrimaryImageUrl() != null) {
+                        productImageUrl = v.getProduct().getPrimaryImageUrl();
+                    }
+                }
+            }
+            final int totalCents = tx.getTotalRetailCents() != null ? tx.getTotalRetailCents() : 0;
+            final BigDecimal price = BigDecimal.valueOf(totalCents).divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+            final UUID fStore = fulfillingStore != null ? fulfillingStore.getId() : null;
+            final UUID oStore = originatingStore != null ? originatingStore.getId() : null;
+            final String fbCode = finalQrToken.getFallbackCode();
+            final OffsetDateTime expiresAt = finalQrToken.getExpiresAt();
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.PAID)
+                    .createdAt(now)
+                    .transactionId(transactionId)
+                    .storeId(fStore)
+                    .fulfillingStoreId(fStore)
+                    .originatingStoreId(oStore)
+                    .variantId(pvId)
+                    .productId(productId)
+                    .productTitle(productTitle)
+                    .productImageUrl(productImageUrl)
+                    .sku(sku)
+                    .retailPrice(price)
+                    .currency("USD")
+                    .expiresAt(expiresAt)
+                    .qrFallbackCode(fbCode)
+                    .runnerId(finalRunnerId2 != null ? finalRunnerId2.toString() : null)
+                    .status(TransactionStatus.PAID.name())
+                    .message("Customer completed payment. Ready for in-store pickup.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("finalizePaidAfterStripe: broadcast PAID failed txId={}", transactionId, ex);
+        }
+        log.info("finalizePaidAfterStripe complete: tx={}, pi={}, runner={}, qrTokenId={}",
+                transactionId, paymentIntentId, runnerId, finalQrToken.getId());
+    }
+
     public Transaction getPaidTransaction(UUID transactionId) {
         return transactionRepository.findById(transactionId)
                 .filter(tx -> tx.getStatus() == TransactionStatus.PAID

@@ -22,6 +22,7 @@ import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.service.CheckoutService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
@@ -43,6 +44,7 @@ public class ConnectController {
     private final StripeConfig stripeConfig;
     private final StoreRepository storeRepository;
     private final TransactionRepository transactionRepository;
+    private final CheckoutService checkoutService;
 
     @Value("${stripe.connect.webhook-secret:}")
     private String connectWebhookSecret;
@@ -394,7 +396,8 @@ public class ConnectController {
         try {
             final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
             if (!(dataObject instanceof Session session)) return;
-            final String txIdRaw = session.getMetadata() != null ? session.getMetadata().get("transactionId") : null;
+            final Map<String, String> metadata = session.getMetadata();
+            final String txIdRaw = metadata != null ? metadata.get("transactionId") : null;
             if (txIdRaw == null) {
                 log.warn("Connect: checkout.session.completed missing transactionId metadata: session={}", session.getId());
                 return;
@@ -402,16 +405,13 @@ public class ConnectController {
             final UUID txId;
             try { txId = UUID.fromString(txIdRaw); }
             catch (IllegalArgumentException iae) { log.warn("Connect: invalid transactionId metadata {}", txIdRaw); return; }
-            transactionRepository.findById(txId).ifPresent(tx -> {
-                if (tx.getStatus() != TransactionStatus.PAID && tx.getStatus() != TransactionStatus.PICKED_UP) {
-                    tx.setStatus(TransactionStatus.PAID);
-                }
-                if (tx.getStripePaymentIntentId() == null || tx.getStripePaymentIntentId().isBlank()) {
-                    tx.setStripePaymentIntentId(session.getPaymentIntent());
-                }
-                transactionRepository.save(tx);
-                log.info("Connect: checkout.session.completed marked transaction {} PAID pi={}", tx.getId(), session.getPaymentIntent());
-            });
+            final boolean explicitPayouts = metadata != null
+                    && (metadata.get("splitFallback") != null
+                        || "true".equalsIgnoreCase(metadata.get("splitFallback"))
+                        || metadata.get("fulfillingConnectId") != null);
+            final String piId = session.getPaymentIntent();
+            checkoutService.finalizeTransactionPaidAfterStripe(txId, piId, explicitPayouts);
+            log.info("Connect: checkout.session.completed finalized tx={} pi={} explicitPayouts={}", txId, piId, explicitPayouts);
         } catch (Exception ex) {
             log.error("Connect: handleCheckoutSessionCompleted failed for event {}", event.getId(), ex);
         }
