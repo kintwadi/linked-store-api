@@ -337,20 +337,116 @@ public class CheckoutController {
             CheckoutSessionRequest request) {
 
         try {
-            final List<String> images = new ArrayList<>();
-            if (request.getPrimaryImageUrl() != null && !request.getPrimaryImageUrl().isBlank()) {
-                images.add(request.getPrimaryImageUrl());
+            final UUID variantId = (request.getVariantId() != null && !request.getVariantId().isBlank())
+                    ? UUID.fromString(request.getVariantId())
+                    : null;
+            final UUID productId = (request.getProductId() != null && !request.getProductId().isBlank())
+                    ? UUID.fromString(request.getProductId())
+                    : null;
+
+            if (productId == null) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("Product is missing from checkout request. Please try again.")
+                        .build());
             }
+
+            final Product product = productRepository.findById(productId).orElse(null);
+            if (product == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("Product not found.")
+                        .build());
+            }
+
+            ProductVariant variant = null;
+            if (variantId != null) {
+                variant = productVariantRepository.findById(variantId).orElse(null);
+            }
+            if (variant == null) {
+                final List<ProductVariant> available = productVariantRepository.findByProductId(productId);
+                variant = available.stream()
+                        .filter(v -> v.getStockQuantity() != null && v.getStockQuantity() > 0)
+                        .findFirst()
+                        .orElse(available.isEmpty() ? null : available.get(0));
+                if (variant == null) {
+                    return ResponseEntity.status(HttpStatus.CONFLICT).body(CheckoutSessionResponse.builder()
+                            .status("error")
+                            .message("No available variant for this product.")
+                            .build());
+                }
+            }
+
+            final UUID fulfillingStoreId = variant.getStoreId();
+            final UUID originatingStoreId = (request.getOriginatingStoreId() != null && !request.getOriginatingStoreId().isBlank())
+                    ? UUID.fromString(request.getOriginatingStoreId())
+                    : variant.getStoreId();
+
+            final int retailCents = Math.max(1, variant.getRetailPriceCents() != null
+                    ? variant.getRetailPriceCents()
+                    : Math.max(1, request.getAmountCents() == null ? 100 : request.getAmountCents().intValue()));
+            final int wholesaleCents = Math.max(1, variant.getWholesalePriceCents() != null
+                    ? variant.getWholesalePriceCents()
+                    : Math.max(1, (int) Math.round(retailCents * 0.6)));
+            final int marginCents = Math.max(0, retailCents - wholesaleCents);
+
+            final Store fulfillingStore = storeRepository.findById(fulfillingStoreId).orElse(null);
+            final Store originatingStore = storeRepository.findById(originatingStoreId).orElse(null);
+            if (originatingStore == null || fulfillingStore == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("Store configuration missing for split ledger checkout.")
+                        .build());
+            }
+
+            final Transaction transaction = Transaction.builder()
+                    .originatingStoreId(originatingStoreId)
+                    .fulfillingStoreId(fulfillingStoreId)
+                    .status(TransactionStatus.READY)
+                    .totalRetailCents(retailCents)
+                    .wholesalePayoutCents(wholesaleCents)
+                    .arbitrageMarginCents(marginCents)
+                    .build();
+            final Transaction saved = transactionRepository.save(transaction);
+
+            try {
+                transactionItemRepository.save(TransactionItem.builder()
+                        .transactionId(saved.getId())
+                        .variantId(variant.getId())
+                        .quantity(1)
+                        .build());
+            } catch (Exception ignore) { /* tx_items are optional for split ledger */ }
+
+            try {
+                final InventoryLock lock = new InventoryLock();
+                lock.setStoreId(fulfillingStoreId);
+                lock.setVariantId(variant.getId());
+                lock.setTransactionId(saved.getId());
+                lock.setLockedQuantity(1);
+                inventoryLockRepository.save(lock);
+            } catch (Exception ignore) { /* inventory lock optional for direct checkout */ }
+
+            final List<String> images = new ArrayList<>();
+            String title = request.getTitle();
+            if (title == null || title.isBlank()) title = product.getTitle();
+            String imageUrl = request.getPrimaryImageUrl();
+            if ((imageUrl == null || imageUrl.isBlank()) && variant.getImageUrl() != null) {
+                imageUrl = variant.getImageUrl();
+            }
+            if ((imageUrl == null || imageUrl.isBlank()) && product.getPrimaryImageUrl() != null) {
+                imageUrl = product.getPrimaryImageUrl();
+            }
+            if (imageUrl != null && !imageUrl.isBlank()) images.add(imageUrl);
+
+            final String currency = "USD";
 
             final Map<String, Object> productData = new HashMap<>();
-            productData.put("name", request.getTitle());
-            if (!images.isEmpty()) {
-                productData.put("images", images);
-            }
+            productData.put("name", title);
+            if (!images.isEmpty()) productData.put("images", images);
 
             final Map<String, Object> priceData = new HashMap<>();
-            priceData.put("currency", request.getCurrency().toLowerCase());
-            priceData.put("unit_amount", request.getAmountCents());
+            priceData.put("currency", currency.toLowerCase());
+            priceData.put("unit_amount", retailCents);
             priceData.put("product_data", productData);
 
             final Map<String, Object> lineItem = new HashMap<>();
@@ -372,19 +468,76 @@ public class CheckoutController {
                 params.put("customer_email", request.getCustomerEmail());
             }
 
-            final Map<String, String> metadata = new HashMap<>();
-            metadata.put("productId", request.getProductId());
-            if (request.getVariantId() != null) {
-                metadata.put("variantId", request.getVariantId());
-            }
-            params.put("metadata", metadata);
+            final String fulfillConnectId = fulfillingStore.getStripeConnectId();
+            final boolean transfersCapable = fulfillConnectId != null
+                    && !fulfillConnectId.isBlank()
+                    && !fulfillConnectId.startsWith("acct_connected_");
 
+            final Map<String, String> metadata = new HashMap<>();
+            metadata.put("transactionId", saved.getId().toString());
+            metadata.put("productId", productId.toString());
+            metadata.put("variantId", variant.getId().toString());
+            metadata.put("originatingStoreId", originatingStoreId.toString());
+            metadata.put("fulfillingStoreId", fulfillingStoreId.toString());
+            metadata.put("wholesalePayoutCents", String.valueOf(wholesaleCents));
+            metadata.put("arbitrageMarginCents", String.valueOf(marginCents));
+
+            if (transfersCapable) {
+                try {
+                    final int platformFeeCents = Math.max(0, retailCents - wholesaleCents - marginCents);
+                    final int transferCap = Math.max(0, retailCents - platformFeeCents);
+                    final int realTransfer = Math.min(wholesaleCents, transferCap);
+                    if (realTransfer <= 0 || wholesaleCents > retailCents) {
+                        throw new IllegalStateException("Wholesale payout exceeds retail amount — using custody fallback.");
+                    }
+                    final Map<String, Object> transferData = new HashMap<>();
+                    transferData.put("destination", fulfillConnectId);
+                    transferData.put("amount", realTransfer);
+                    final Map<String, Object> paymentIntentData = new HashMap<>();
+                    paymentIntentData.put("transfer_data", transferData);
+                    if (platformFeeCents > 0) {
+                        paymentIntentData.put("application_fee_amount", platformFeeCents);
+                    }
+                    params.put("payment_intent_data", paymentIntentData);
+                    params.put("metadata", metadata);
+                    final Session session = Session.create(params);
+                    return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
+                            .id(session.getId())
+                            .url(session.getUrl())
+                            .status("ok")
+                            .build());
+                } catch (StripeException | IllegalStateException primaryEx) {
+                    final String msg = (primaryEx instanceof StripeException sex)
+                            ? (sex.getUserMessage() != null ? sex.getUserMessage() : sex.getMessage())
+                            : primaryEx.getMessage();
+                    log.warn("Primary direct checkout split transfer failed for product {} ({}). " +
+                            "Falling back to custody-style payout after payment.", productId, msg);
+                    metadata.put("splitFallback", "capability-or-amount-error; explicit Transfers will reconcile after custody proof.");
+                    metadata.put("fulfillingConnectId", fulfillConnectId);
+                    metadata.put("originatingConnectId",
+                            storeRepository.findById(originatingStoreId)
+                                    .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "")
+                                    .orElse(""));
+                }
+            }
+
+            params.put("metadata", metadata);
             final Session session = Session.create(params);
 
             return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
                     .id(session.getId())
                     .url(session.getUrl())
-                    .status("ok")
+                    .status(transfersCapable ? "ok_fallback_split" : "ok")
+                    .message(transfersCapable
+                            ? "Fallback: declarative split transfer unavailable for destination account. " +
+                            "Platform will issue explicit wholesale + margin transfers after payment custody."
+                            : null)
+                    .build());
+        } catch (IllegalArgumentException iae) {
+            log.error("Invalid UUID in checkout request for productId={}", request.getProductId(), iae);
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(CheckoutSessionResponse.builder()
+                    .status("error")
+                    .message("Invalid product or store identifier.")
                     .build());
         } catch (StripeException ex) {
             log.error("Failed creating Stripe Checkout Session for productId={}", request.getProductId(), ex);

@@ -37,4 +37,6 @@ public class CheckoutSessionRequest {
     private String cancelUrl;
 
     private String customerEmail;
+
+    private String originatingStoreId;
 }
