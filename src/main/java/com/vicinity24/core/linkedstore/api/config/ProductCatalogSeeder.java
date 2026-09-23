@@ -25,6 +25,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -265,9 +266,32 @@ public class ProductCatalogSeeder {
                               String address, String postalCode) {
         String effectiveAddress = (address == null || address.isBlank()) ? "General Delivery" : address;
         String effectivePostalCode = (postalCode == null || postalCode.isBlank()) ? "00000" : postalCode;
-        List<Store> matches = storeRepository.findAllByBusinessName(businessName);
+
+        final List<Store> candidates = new ArrayList<>();
+        if (stripeConnectId != null && !stripeConnectId.isBlank()) {
+            storeRepository.findByStripeConnectId(stripeConnectId).ifPresent(candidates::add);
+        }
+        candidates.addAll(storeRepository.findAllByBusinessName(businessName));
+        if (stripeConnectId != null && !stripeConnectId.isBlank()) {
+            final String prefix = businessName.split("\\s+—\\s+|\\s+-\\s+|\\s*\\(")[0].trim();
+            if (!prefix.isBlank()) {
+                for (Store s : storeRepository.findAll()) {
+                    if (stripeConnectId.equals(s.getStripeConnectId())) {
+                        if (!candidates.stream().anyMatch(c -> c.getId().equals(s.getId()))) candidates.add(s);
+                        continue;
+                    }
+                    if (s.getBusinessName() != null
+                            && (s.getBusinessName().equalsIgnoreCase(businessName)
+                                || s.getBusinessName().startsWith(prefix)
+                                || businessName.startsWith(s.getBusinessName().split("\\s+—\\s+|\\s+-\\s+|\\s*\\(")[0].trim()))) {
+                        if (!candidates.stream().anyMatch(c -> c.getId().equals(s.getId()))) candidates.add(s);
+                    }
+                }
+            }
+        }
+
         Store chosen;
-        if (matches.isEmpty()) {
+        if (candidates.isEmpty()) {
             String code = generateUniqueGatewayCode(storeRepository);
             chosen = storeRepository.save(Store.builder()
                     .businessName(businessName)
@@ -284,19 +308,24 @@ public class ProductCatalogSeeder {
                     .gatewayCode(code)
                     .build());
         } else {
-            chosen = matches.stream()
+            chosen = candidates.stream()
                     .filter(s -> s.getStripeConnectId() != null
                             && s.getStripeConnectId().startsWith("acct_1"))
                     .findFirst()
-                    .orElse(matches.get(0));
-            if (matches.size() > 1) {
-                for (Store dup : matches) {
+                    .orElse(candidates.get(0));
+            if (candidates.size() > 1) {
+                for (Store dup : candidates) {
                     if (!dup.getId().equals(chosen.getId())) {
                         storeRepository.deleteById(dup.getId());
                     }
                 }
             }
             boolean dirty = false;
+            if (chosen.getBusinessName() == null
+                    || chosen.getBusinessName().length() < businessName.length()) {
+                chosen.setBusinessName(businessName);
+                dirty = true;
+            }
             if (chosen.getLatitude().compareTo(lat) != 0) { chosen.setLatitude(lat); dirty = true; }
             if (chosen.getLongitude().compareTo(lng) != 0) { chosen.setLongitude(lng); dirty = true; }
             if ((chosen.getCountryCode() == null || chosen.getCountryCode().isBlank()) && countryCode != null) {
