@@ -7,6 +7,7 @@ import com.vicinity24.core.linkedstore.api.dto.TxEvent;
 import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.service.CheckoutService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -33,6 +34,7 @@ public class TransactionController {
     private final QrTokenRepository qrTokenRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
     private final ObjectMapper objectMapper;
+    private final CheckoutService checkoutService;
 
     @GetMapping("/{id}")
     public ResponseEntity<TransactionResponse> getTransaction(@PathVariable("id") UUID txId) {
@@ -54,42 +56,9 @@ public class TransactionController {
         try { id = UUID.fromString(idStr); } catch (IllegalArgumentException e) { return ResponseEntity.badRequest().build(); }
         Transaction tx = transactionRepository.findById(id).orElse(null);
         if (tx == null) return ResponseEntity.notFound().build();
-        boolean changed = false;
-        if (tx.getStatus() != TransactionStatus.PAID && tx.getStatus() != TransactionStatus.PICKED_UP) {
-            tx.setStatus(TransactionStatus.PAID);
-            changed = true;
-        }
-        if (pi != null && !pi.isBlank() && !pi.equals(tx.getStripePaymentIntentId())) {
-            tx.setStripePaymentIntentId(pi);
-            changed = true;
-        }
-        if (changed) tx = transactionRepository.save(tx);
-        TransactionResponse resp = buildTransactionResponse(tx);
-        if (changed) {
-            try {
-                BigDecimal price = resp.getTotalRetailCents() != null
-                        ? BigDecimal.valueOf(resp.getTotalRetailCents()).scaleByPowerOfTen(-2)
-                        : null;
-                eventBroadcaster.broadcast(TxEvent.builder()
-                        .type(TxEventType.PAID)
-                        .createdAt(OffsetDateTime.now())
-                        .transactionId(tx.getId())
-                        .storeId(tx.getFulfillingStoreId())
-                        .fulfillingStoreId(tx.getFulfillingStoreId())
-                        .originatingStoreId(tx.getOriginatingStoreId())
-                        .variantId(resp.getVariantId())
-                        .productId(resp.getProductId())
-                        .productTitle(resp.getProductTitle())
-                        .productImageUrl(resp.getProductImageUrl())
-                        .sku(resp.getSku())
-                        .retailPrice(price)
-                        .currency(resp.getCurrency() != null ? resp.getCurrency() : "USD")
-                        .status(tx.getStatus().name())
-                        .message("Customer completed payment. Ready for in-store pickup.")
-                        .build());
-            } catch (Exception ex) { log.warn("markPaid: broadcast PAID failed txId={}", tx.getId(), ex); }
-        }
-        return ResponseEntity.ok(resp);
+        checkoutService.finalizeTransactionPaidAfterStripe(id, pi, false);
+        tx = transactionRepository.findById(id).orElse(tx);
+        return ResponseEntity.ok(buildTransactionResponse(tx));
     }
 
     private TransactionResponse buildTransactionResponse(Transaction tx) {

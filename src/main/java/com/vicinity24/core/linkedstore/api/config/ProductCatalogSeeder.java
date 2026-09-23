@@ -48,10 +48,6 @@ public class ProductCatalogSeeder {
     @EventListener(ContextRefreshedEvent.class)
     @Transactional
     public void seedCatalog() {
-        em.createNativeQuery("DELETE FROM inventory_locks").executeUpdate();
-        em.createNativeQuery("DELETE FROM qr_tokens").executeUpdate();
-        em.createNativeQuery("DELETE FROM transaction_items").executeUpdate();
-        em.createNativeQuery("DELETE FROM transactions").executeUpdate();
 
         runDdlSilently("""
             ALTER TABLE qr_tokens
@@ -114,8 +110,27 @@ public class ProductCatalogSeeder {
                 "https://images.unsplash.com/photo-1556905055-8f358a7a47b2?auto=format&fit=crop&w=1400&h=700&q=80",
                 "186 Bedford Ave, Brooklyn, NY",
                 "11249");
-        log.info("CatalogSeeder: stores=[{}, {}, {}]", storeDowntown.getBusinessName(),
-                storeUptown.getBusinessName(), storeBrooklyn.getBusinessName());
+        var storeA = ensureStore("store-a-04",
+                "StoreA — Midtown Sneaker Lab",
+                new BigDecimal("40.754930"), new BigDecimal("-73.984020"),
+                "US", "USD",
+                "acct_1UH2agGZ3vjZMcEq",
+                "https://images.unsplash.com/photo-1491553895911-0055uj83r7b9?auto=format&fit=crop&w=400&h=400&q=80",
+                "https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=1400&h=700&q=80",
+                "350 Fifth Ave, Midtown, New York, NY",
+                "10118");
+        var storeB = ensureStore("store-b-05",
+                "StoreB — Queens Outlet Hub",
+                new BigDecimal("40.749000"), new BigDecimal("-73.940000"),
+                "US", "USD",
+                "acct_1UH2jfGoUT7LodNw",
+                "https://images.unsplash.com/photo-1552346154-21d32810aba3?auto=format&fit=crop&w=400&h=400&q=80",
+                "https://images.unsplash.com/photo-1483985988355-763728e1935b?auto=format&fit=crop&w=1400&h=700&q=80",
+                "47-10 Van Dam St, Long Island City, Queens, NY",
+                "11101");
+        log.info("CatalogSeeder: stores=[{}, {}, {}, {}, {}]", storeDowntown.getBusinessName(),
+                storeUptown.getBusinessName(), storeBrooklyn.getBusinessName(),
+                storeA.getBusinessName(), storeB.getBusinessName());
 
         Product airmax = ensureProduct("prd-airmax-pulse",
                 "Nike Air Max Pulse — Running",
@@ -170,7 +185,9 @@ public class ProductCatalogSeeder {
                 v(storeBrooklyn, "ub-light-slv-43", 12800, 18900, 3, Map.of("size", "EU 43", "color", "Halo Silver"),
                         "https://images.unsplash.com/photo-1595341888016-a392ef81b7de?auto=format&fit=crop&w=600&h=600&q=80"),
                 v(storeBrooklyn, "ub-light-slv-44", 12800, 19500, 2, Map.of("size", "EU 44", "color", "Halo Silver"),
-                        "https://images.unsplash.com/photo-1551107696-a4b0c5a0d9a2?auto=format&fit=crop&w=600&h=600&q=80")
+                        "https://images.unsplash.com/photo-1551107696-a4b0c5a0d9a2?auto=format&fit=crop&w=600&h=600&q=80"),
+                v(storeA,        "ub-light-slv-45", 6000, 10000, 5, Map.of("size", "EU 45", "color", "Halo Silver"),
+                        "https://images.unsplash.com/photo-1556906781-9a412961c28c?auto=format&fit=crop&w=600&h=600&q=80")
         ));
 
         Product techfleece = ensureProduct("prd-techfleece-windrunner",

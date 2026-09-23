@@ -578,6 +578,89 @@ public class CheckoutController {
         return ResponseEntity.status(HttpStatus.OK).body(response);
     }
 
+    public record ConfirmSessionPaidRequest(
+            @jakarta.validation.constraints.NotBlank String sessionId
+    ) {}
+
+    public record ConfirmSessionPaidResponse(
+            String status,
+            String message,
+            String transactionId,
+            String transactionStatus,
+            String stripePaymentIntentId,
+            boolean finalized
+    ) {}
+
+    @PostMapping("/confirm-session-paid")
+    public ResponseEntity<ConfirmSessionPaidResponse> confirmSessionPaid(
+            @Valid @RequestBody ConfirmSessionPaidRequest request) {
+        final String sessionId = request.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(
+                    new ConfirmSessionPaidResponse("error", "sessionId is required", null, null, null, false));
+        }
+        if (Stripe.apiKey == null || Stripe.apiKey.isBlank()) {
+            Stripe.apiKey = stripeConfig.getStripeApiKey();
+        }
+        try {
+            final Session session = Session.retrieve(sessionId);
+            if (session == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(
+                        new ConfirmSessionPaidResponse("error", "Stripe session not found", null, null, null, false));
+            }
+            final String paymentStatus = session.getPaymentStatus();
+            final String sessionStatus = session.getStatus();
+            final boolean paid = "paid".equalsIgnoreCase(paymentStatus)
+                    || "complete".equalsIgnoreCase(sessionStatus);
+            if (!paid) {
+                return ResponseEntity.status(HttpStatus.OK).body(
+                        new ConfirmSessionPaidResponse("not_paid",
+                                "Stripe session is not yet paid: paymentStatus=" + paymentStatus + " status=" + sessionStatus,
+                                null, null, session.getPaymentIntent(), false));
+            }
+            final Map<String, String> meta = session.getMetadata();
+            final String txIdRaw = meta != null ? meta.get("transactionId") : null;
+            if (txIdRaw == null || txIdRaw.isBlank()) {
+                return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(
+                        new ConfirmSessionPaidResponse("error",
+                                "Stripe session metadata missing transactionId; cannot finalize",
+                                null, null, session.getPaymentIntent(), false));
+            }
+            final UUID txId;
+            try { txId = UUID.fromString(txIdRaw); }
+            catch (IllegalArgumentException iae) {
+                return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(
+                        new ConfirmSessionPaidResponse("error", "Invalid transactionId in session metadata",
+                                null, null, session.getPaymentIntent(), false));
+            }
+            final boolean explicitPayouts = meta != null
+                    && (meta.get("splitFallback") != null
+                        || "true".equalsIgnoreCase(meta.get("splitFallback"))
+                        || meta.get("fulfillingConnectId") != null);
+            checkoutService.finalizeTransactionPaidAfterStripe(txId, session.getPaymentIntent(), explicitPayouts);
+            final Transaction tx = transactionRepository.findById(txId).orElse(null);
+            return ResponseEntity.status(HttpStatus.OK).body(
+                    new ConfirmSessionPaidResponse("ok", "Session confirmed finalized to PAID.",
+                            tx != null ? tx.getId().toString() : txIdRaw,
+                            tx != null && tx.getStatus() != null ? tx.getStatus().name() : TransactionStatus.PAID.name(),
+                            session.getPaymentIntent(),
+                            true));
+        } catch (StripeException se) {
+            log.error("CheckoutController.confirmSessionPaid Stripe error session={}", sessionId, se);
+            final int code = se.getStatusCode() != null ? se.getStatusCode() : 502;
+            return ResponseEntity.status(code).body(
+                    new ConfirmSessionPaidResponse("error",
+                            "Stripe error: " + (se.getMessage() == null ? se.toString() : se.getMessage()),
+                            null, null, null, false));
+        } catch (Exception ex) {
+            log.error("CheckoutController.confirmSessionPaid failed session={}", sessionId, ex);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
+                    new ConfirmSessionPaidResponse("error",
+                            "Internal error: " + (ex.getMessage() == null ? ex.toString() : ex.getMessage()),
+                            null, null, null, false));
+        }
+    }
+
     private String maskPaymentMethod(String pmId) {
         if (pmId == null) {
             return null;
