@@ -9,20 +9,29 @@ import com.vicinity24.core.linkedstore.api.dto.CheckoutPayRequest;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutPayResponse;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutSessionRequest;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutSessionResponse;
+import com.vicinity24.core.linkedstore.api.dto.TxEvent;
+import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.InventoryLock;
+import com.vicinity24.core.linkedstore.api.entity.InventoryLockStatus;
 import com.vicinity24.core.linkedstore.api.entity.Product;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
+import com.vicinity24.core.linkedstore.api.entity.QrToken;
 import com.vicinity24.core.linkedstore.api.entity.Store;
+import com.vicinity24.core.linkedstore.api.entity.StoreUser;
+import com.vicinity24.core.linkedstore.api.entity.StoreUserRole;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionItem;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
 import com.vicinity24.core.linkedstore.api.repository.InventoryLockRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
+import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
+import com.vicinity24.core.linkedstore.api.repository.StoreUserRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionItemRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.service.CheckoutService;
+import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +39,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.security.SecureRandom;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -43,6 +56,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class CheckoutController {
 
+    private static final int QR_TOKEN_TTL_MINUTES = 60;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
     private final CheckoutService checkoutService;
     private final StripeConfig stripeConfig;
     private final TransactionRepository transactionRepository;
@@ -51,6 +67,9 @@ public class CheckoutController {
     private final ProductRepository productRepository;
     private final InventoryLockRepository inventoryLockRepository;
     private final TransactionItemRepository transactionItemRepository;
+    private final QrTokenRepository qrTokenRepository;
+    private final StoreUserRepository storeUserRepository;
+    private final TransactionEventBroadcaster eventBroadcaster;
 
     @PostMapping("/sessions")
     public ResponseEntity<CheckoutSessionResponse> createSession(
@@ -402,7 +421,7 @@ public class CheckoutController {
             final Transaction transaction = Transaction.builder()
                     .originatingStoreId(originatingStoreId)
                     .fulfillingStoreId(fulfillingStoreId)
-                    .status(TransactionStatus.READY)
+                    .status(TransactionStatus.RESERVED)
                     .totalRetailCents(retailCents)
                     .wholesalePayoutCents(wholesaleCents)
                     .arbitrageMarginCents(marginCents)
@@ -417,14 +436,70 @@ public class CheckoutController {
                         .build());
             } catch (Exception ignore) { /* tx_items are optional for split ledger */ }
 
+            final OffsetDateTime now = OffsetDateTime.now();
+            final int countdownSeconds = 900;
+
             try {
                 final InventoryLock lock = new InventoryLock();
                 lock.setStoreId(fulfillingStoreId);
                 lock.setVariantId(variant.getId());
                 lock.setTransactionId(saved.getId());
                 lock.setLockedQuantity(1);
+                lock.setExpiresAt(now.plusSeconds(countdownSeconds));
+                lock.setStatus(InventoryLockStatus.HELD);
                 inventoryLockRepository.save(lock);
             } catch (Exception ignore) { /* inventory lock optional for direct checkout */ }
+
+            UUID runnerId = assignRunnerForOriginatingStoreInline(originatingStoreId, fulfillingStoreId);
+            if (runnerId != null) {
+                saved.setRunnerId(runnerId);
+                transactionRepository.save(saved);
+            }
+
+            String secureToken = generateSecureTokenInline(saved.getId(), runnerId, now);
+            String fallbackCode = generateFallbackCodeInline();
+            OffsetDateTime qrExpiresAt = now.plusMinutes(QR_TOKEN_TTL_MINUTES);
+            try {
+                qrTokenRepository.save(QrToken.builder()
+                        .transactionId(saved.getId())
+                        .runnerId(runnerId)
+                        .secureToken(secureToken)
+                        .fallbackCode(fallbackCode)
+                        .expiresAt(qrExpiresAt)
+                        .build());
+            } catch (Exception ignore) { /* qr token optional */ }
+
+            String productImageUrl = product.getPrimaryImageUrl() != null
+                    ? product.getPrimaryImageUrl()
+                    : variant.getImageUrl();
+            OffsetDateTime pickupExpiresAt = now.plusSeconds(countdownSeconds);
+            try {
+                eventBroadcaster.broadcast(TxEvent.builder()
+                        .type(TxEventType.RESERVED)
+                        .createdAt(now)
+                        .transactionId(saved.getId())
+                        .storeId(fulfillingStoreId)
+                        .fulfillingStoreId(fulfillingStoreId)
+                        .originatingStoreId(originatingStoreId)
+                        .variantId(variant.getId())
+                        .productId(product.getId())
+                        .productTitle(product.getTitle())
+                        .productImageUrl(productImageUrl)
+                        .sku(variant.getSku())
+                        .retailPrice(BigDecimal.valueOf(retailCents)
+                                .setScale(2, RoundingMode.UNNECESSARY)
+                                .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP))
+                        .currency("USD")
+                        .expiresAt(pickupExpiresAt)
+                        .countdownSeconds(countdownSeconds)
+                        .qrFallbackCode(fallbackCode)
+                        .runnerId(runnerId != null ? runnerId.toString() : null)
+                        .status("RESERVED")
+                        .message("Item reserved — 15-minute hold for customer pickup.")
+                        .build());
+            } catch (Exception ex) {
+                log.warn("DirectCheckout: broadcast RESERVED event failed txId={}", saved.getId(), ex);
+            }
 
             final List<String> images = new ArrayList<>();
             String title = request.getTitle();
@@ -669,5 +744,70 @@ public class CheckoutController {
             return "***";
         }
         return pmId.substring(0, 4) + "_****_" + pmId.substring(pmId.length() - 4);
+    }
+
+    private UUID assignRunnerForOriginatingStoreInline(UUID originatingStoreId, UUID fulfillingStoreId) {
+        if (fulfillingStoreId != null) {
+            List<StoreUser> fulfillRunners = storeUserRepository.findByStoreIdAndRole(
+                    fulfillingStoreId, StoreUserRole.RUNNER);
+            if (!fulfillRunners.isEmpty()) {
+                return fulfillRunners.get(0).getId();
+            }
+        }
+        if (originatingStoreId != null) {
+            List<StoreUser> runners = storeUserRepository.findByStoreIdAndRole(
+                    originatingStoreId, StoreUserRole.RUNNER);
+            if (!runners.isEmpty()) {
+                return runners.get(0).getId();
+            }
+            List<StoreUser> owners = storeUserRepository.findByStoreIdAndRole(
+                    originatingStoreId, StoreUserRole.OWNER);
+            if (!owners.isEmpty()) {
+                return owners.get(0).getId();
+            }
+            List<StoreUser> storeAdmins = storeUserRepository.findByStoreIdAndRole(
+                    originatingStoreId, StoreUserRole.STORE_ADMIN);
+            if (!storeAdmins.isEmpty()) {
+                return storeAdmins.get(0).getId();
+            }
+            List<StoreUser> representatives = storeUserRepository.findByStoreIdAndRole(
+                    originatingStoreId, StoreUserRole.STORE_REPRESENTATIVE);
+            if (!representatives.isEmpty()) {
+                return representatives.get(0).getId();
+            }
+            List<StoreUser> clerks = storeUserRepository.findByStoreIdAndRole(
+                    originatingStoreId, StoreUserRole.CLERK);
+            if (!clerks.isEmpty()) {
+                return clerks.get(0).getId();
+            }
+            List<StoreUser> fallback = storeUserRepository.findByStoreId(originatingStoreId);
+            if (!fallback.isEmpty()) {
+                return fallback.get(0).getId();
+            }
+        }
+        return null;
+    }
+
+    private String generateSecureTokenInline(UUID txId, UUID runnerId, OffsetDateTime now) {
+        final String base = (txId != null ? txId.toString() : UUID.randomUUID().toString())
+                + "|" + (runnerId != null ? runnerId.toString() : "no-runner")
+                + "|" + (now != null ? now.toString() : OffsetDateTime.now().toString())
+                + "|" + SECURE_RANDOM.nextLong();
+        try {
+            final byte[] raw = java.nio.charset.StandardCharsets.UTF_8.encode(base).array();
+            final byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw);
+            return "ls_" + java.util.Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(java.util.Arrays.copyOfRange(digest, 0, 12));
+        } catch (java.security.NoSuchAlgorithmException nsae) {
+            throw new RuntimeException("SHA-256 not available on JVM", nsae);
+        }
+    }
+
+    private String generateFallbackCodeInline() {
+        final StringBuilder sb = new StringBuilder(8);
+        for (int i = 0; i < 8; i++) {
+            sb.append(SECURE_RANDOM.nextInt(10));
+        }
+        return sb.toString();
     }
 }
