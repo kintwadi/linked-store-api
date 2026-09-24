@@ -24,7 +24,10 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import org.hibernate.Session;
+
 import java.math.BigDecimal;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +70,12 @@ public class ProductCatalogSeeder {
         runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ");
         runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ");
         runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(512)");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(512)");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(64)");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS name VARCHAR(255)");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS role VARCHAR(50)");
+        runDdlSilently("ALTER TABLE store_users ADD COLUMN IF NOT EXISTS store_id UUID");
         runDdlSilently("ALTER TABLE store_users ALTER COLUMN role TYPE VARCHAR(50)");
         runDdlSilently("ALTER TABLE store_users ALTER COLUMN name TYPE VARCHAR(255)");
         runDdlSilently("ALTER TABLE store_users ALTER COLUMN store_id DROP NOT NULL");
@@ -429,7 +438,12 @@ public class ProductCatalogSeeder {
 
     private void runDdlSilently(String sql) {
         try {
-            em.createNativeQuery(sql).executeUpdate();
+            Session session = em.unwrap(Session.class);
+            session.doWork(connection -> {
+                try (Statement stmt = connection.createStatement()) {
+                    stmt.execute(sql);
+                }
+            });
         } catch (Exception e) {
             log.debug("DDL no-op (already exists or unsupported): {}", e.getMessage());
         }
