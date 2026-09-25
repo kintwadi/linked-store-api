@@ -31,4 +31,6 @@ public class ReservationRequest {
 
     @Builder.Default
     private Integer countdownSeconds = 900;
+
+    private Integer hostRetailPriceCents;
 }

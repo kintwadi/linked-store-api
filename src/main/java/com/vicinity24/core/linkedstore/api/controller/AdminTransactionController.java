@@ -375,11 +375,15 @@ public class AdminTransactionController {
             if (myStoreId.equals(tx.getOriginatingStoreId())) {
                 perspectiveRole = "RETAIL_HOST";
                 perspectiveStoreId = tx.getOriginatingStoreId();
-                perspectivePriceCents = tx.getTotalRetailCents();
+                perspectivePriceCents = tx.getArbitrageMarginCents() != null
+                        ? tx.getArbitrageMarginCents()
+                        : 0;
             } else if (myStoreId.equals(tx.getFulfillingStoreId())) {
                 perspectiveRole = "WHOLESALE_SELLER";
                 perspectiveStoreId = tx.getFulfillingStoreId();
-                perspectivePriceCents = tx.getWholesalePayoutCents();
+                perspectivePriceCents = tx.getWholesalePayoutCents() != null
+                        ? tx.getWholesalePayoutCents()
+                        : 0;
             } else {
                 perspectiveRole = "NETWORK";
                 perspectivePriceCents = tx.getTotalRetailCents();

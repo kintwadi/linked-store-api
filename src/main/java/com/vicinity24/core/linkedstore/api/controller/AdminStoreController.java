@@ -866,6 +866,149 @@ public class AdminStoreController {
 
     // ---------- tx status transitions (broadcasts SSE events) ----------
 
+    /** Fulfilling-store accept: REQUESTED → RESERVED. Decrements stock, creates HELD lock, starts 15-minute countdown. Idempotent. */
+    @PostMapping(value = "/{storeId}/transactions/{txId}/accept-request")
+    @Transactional
+    public ResponseEntity<?> storeAcceptRequest(@PathVariable UUID storeId, @PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        permissionService.ensureCanManageStoreRequests(cu, storeId);
+        return doAcceptRequest(txId, storeId);
+    }
+
+    @PostMapping(value = "/me/transactions/{txId}/accept-request")
+    @Transactional
+    public ResponseEntity<?> myStoreAcceptRequest(@PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        final Store store = resolveMyStore(cu);
+        permissionService.ensureCanManageStoreRequests(cu, store.getId());
+        return doAcceptRequest(txId, store.getId());
+    }
+
+    /** Fulfilling-store reject: REQUESTED → CANCELED. No stock touched (never decremented at REQUESTED time). Idempotent. */
+    @PostMapping(value = "/{storeId}/transactions/{txId}/reject-request")
+    @Transactional
+    public ResponseEntity<?> storeRejectRequest(@PathVariable UUID storeId, @PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        permissionService.ensureCanManageStoreRequests(cu, storeId);
+        return doRejectRequest(txId, storeId);
+    }
+
+    @PostMapping(value = "/me/transactions/{txId}/reject-request")
+    @Transactional
+    public ResponseEntity<?> myStoreRejectRequest(@PathVariable UUID txId) {
+        final CurrentUser cu = authenticationFacade.current();
+        final Store store = resolveMyStore(cu);
+        permissionService.ensureCanManageStoreRequests(cu, store.getId());
+        return doRejectRequest(txId, store.getId());
+    }
+
+    private ResponseEntity<?> doAcceptRequest(UUID txId, UUID fulfillingStoreId) {
+        Transaction tx = transactionRepository.findById(txId).orElse(null);
+        if (tx == null) return ResponseEntity.notFound().build();
+        if (!tx.getFulfillingStoreId().equals(fulfillingStoreId)
+                && !authenticationFacade.current().isGlobalAdmin()) {
+            return ResponseEntity.status(403).build();
+        }
+        if (tx.getStatus() == TransactionStatus.RESERVED
+                || tx.getStatus() == TransactionStatus.READY
+                || tx.getStatus() == TransactionStatus.PAID
+                || tx.getStatus() == TransactionStatus.PICKED_UP) {
+            return ResponseEntity.ok(buildTxEventResponseOrEmpty(tx));
+        }
+        if (tx.getStatus() != TransactionStatus.REQUESTED
+                && tx.getStatus() != TransactionStatus.PENDING_RESERVATION) {
+            return ResponseEntity.status(409).body(Map.of("message",
+                    "Only REQUESTED transactions can be accepted. Current=" + tx.getStatus()));
+        }
+        final TransactionResponse txr = transactionController != null
+                ? transactionController.getTransaction(txId).getBody()
+                : null;
+        final UUID variantId;
+        if (tx.getVariantId() != null) {
+            variantId = tx.getVariantId();
+        } else if (txr != null && txr.getVariantId() != null) {
+            variantId = txr.getVariantId();
+        } else {
+            Optional<InventoryLock> existing = inventoryLockRepository.findByTransactionId(tx.getId()).stream().findFirst();
+            variantId = existing.map(InventoryLock::getVariantId).orElse(null);
+        }
+        if (variantId == null) {
+            return ResponseEntity.status(422).body(Map.of("message",
+                    "Cannot accept REQUESTED tx: variantId unknown for txId=" + txId));
+        }
+        int decremented = 0;
+        ProductVariant variant = productVariantRepository.findById(variantId).orElse(null);
+        if (variant != null) {
+            decremented = productVariantRepository.decrementStockWithOptimisticLock(variantId, 1, variant.getVersion());
+            if (decremented == 0) {
+                ProductVariant reloaded = productVariantRepository.findById(variantId).orElse(null);
+                if (reloaded != null) {
+                    decremented = productVariantRepository.decrementStockWithOptimisticLock(variantId, 1, reloaded.getVersion());
+                }
+            }
+        }
+        if (decremented == 0) {
+            tx.setStatus(TransactionStatus.CANCELED);
+            tx = transactionRepository.save(tx);
+            try {
+                eventBroadcaster.broadcast(buildTxEvent(TxEventType.FULFILLER_REJECTED, tx, txr,
+                        "Seller confirmed inventory unavailable during accept."));
+            } catch (Exception ignore) {}
+            return ResponseEntity.status(409).body(Map.of("message",
+                    "Accept failed: item out of stock during seller accept step (race_lost). Transitioned tx to CANCELED."));
+        }
+        OffsetDateTime now = OffsetDateTime.now();
+        final int countdownSeconds = 900;
+        InventoryLock lock = InventoryLock.builder()
+                .transactionId(tx.getId())
+                .variantId(variantId)
+                .storeId(fulfillingStoreId)
+                .lockedQuantity(1)
+                .expiresAt(now.plusSeconds(countdownSeconds))
+                .status(InventoryLockStatus.HELD)
+                .build();
+        inventoryLockRepository.save(lock);
+
+        tx.setStatus(TransactionStatus.RESERVED);
+        tx = transactionRepository.save(tx);
+
+        try {
+            eventBroadcaster.broadcast(buildTxEvent(TxEventType.FULFILLER_ACCEPTED, tx, txr,
+                    "Seller accepted — item held 15 minutes for checkout."));
+        } catch (Exception ex) { log.warn("Admin: broadcast FULFILLER_ACCEPTED failed txId={}", txId, ex); }
+        return ResponseEntity.ok(buildTxEventResponseOrEmpty(tx));
+    }
+
+    private ResponseEntity<?> doRejectRequest(UUID txId, UUID fulfillingStoreId) {
+        Transaction tx = transactionRepository.findById(txId).orElse(null);
+        if (tx == null) return ResponseEntity.notFound().build();
+        if (!tx.getFulfillingStoreId().equals(fulfillingStoreId)
+                && !authenticationFacade.current().isGlobalAdmin()) {
+            return ResponseEntity.status(403).build();
+        }
+        if (tx.getStatus() == TransactionStatus.CANCELED || tx.getStatus() == TransactionStatus.EXPIRED) {
+            try {
+                eventBroadcaster.broadcast(buildTxEvent(TxEventType.FULFILLER_REJECTED, tx, null,
+                        "Seller rejected availability request."));
+            } catch (Exception ignore) {}
+            return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+        }
+        if (tx.getStatus() != TransactionStatus.REQUESTED) {
+            return ResponseEntity.status(409).body(Map.of("message",
+                    "Only REQUESTED transactions can be rejected. Current=" + tx.getStatus()));
+        }
+        tx.setStatus(TransactionStatus.CANCELED);
+        tx = transactionRepository.save(tx);
+        final TransactionResponse txr = transactionController != null
+                ? transactionController.getTransaction(txId).getBody()
+                : null;
+        try {
+            eventBroadcaster.broadcast(buildTxEvent(TxEventType.FULFILLER_REJECTED, tx, txr,
+                    "Seller rejected — item no longer reserved, try another store."));
+        } catch (Exception ex) { log.warn("Admin: broadcast FULFILLER_REJECTED failed txId={}", txId, ex); }
+        return ResponseEntity.ok(Map.of("transactionId", txId.toString(), "status", tx.getStatus().name()));
+    }
+
     /** Mark RESERVED → READY: store has item on shelf, waiting for customer within the 15-minute hold window. */
     @PostMapping(value = "/{storeId}/transactions/{txId}/mark-ready")
     @Transactional
@@ -1389,12 +1532,34 @@ public class AdminStoreController {
             } else {
                 role = "FULFILL";
             }
+            final int perspectivePriceCents;
+            switch (role) {
+                case "HOST":
+                    perspectivePriceCents = tx.getArbitrageMarginCents() != null
+                            ? tx.getArbitrageMarginCents()
+                            : 0;
+                    break;
+                case "FULFILL":
+                    perspectivePriceCents = tx.getWholesalePayoutCents() != null
+                            ? tx.getWholesalePayoutCents()
+                            : 0;
+                    break;
+                case "BOTH":
+                default:
+                    perspectivePriceCents = tx.getTotalRetailCents() != null
+                            ? tx.getTotalRetailCents()
+                            : 0;
+                    break;
+            }
             result.add(StoreTransactionResponse.builder()
                     .id(tx.getId())
                     .status(tx.getStatus() != null ? tx.getStatus().name() : null)
                     .originatingStoreId(tx.getOriginatingStoreId())
                     .fulfillingStoreId(tx.getFulfillingStoreId())
                     .totalAmountCents(tx.getTotalRetailCents())
+                    .wholesalePayoutCents(tx.getWholesalePayoutCents())
+                    .arbitrageMarginCents(tx.getArbitrageMarginCents())
+                    .perspectivePriceCents(perspectivePriceCents)
                     .createdAt(tx.getCreatedAt())
                     .itemsCount(itemsCount)
                     .role(role)

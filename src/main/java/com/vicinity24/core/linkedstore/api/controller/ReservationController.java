@@ -49,6 +49,8 @@ public class ReservationController {
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final int DEFAULT_HOST_MARKUP_MULTIPLIER_BASIS_POINTS = 150; // 1.50x = 150 basis points of wholesale (multiply/100)
+    private static final int PLATFORM_FEE_PERCENT_BASIS_POINTS = 0; // 0% per application.yml linkedstore.platform-fee-percent
 
     @PostMapping("")
     @Transactional
@@ -123,6 +125,156 @@ public class ReservationController {
                     .build());
         }
 
+        final boolean crossStoreSplit = !originatingStoreId.equals(variant.getStoreId());
+
+        final int wholesalePayoutCents = variant.getWholesalePriceCents() != null
+                ? variant.getWholesalePriceCents()
+                : Math.max(0, (int) Math.round(variant.getRetailPriceCents() * 0.7));
+        final int totalRetailCents;
+        final int platformFeeCents;
+        if (crossStoreSplit) {
+            if (request.getHostRetailPriceCents() != null && request.getHostRetailPriceCents() > 0) {
+                totalRetailCents = request.getHostRetailPriceCents();
+            } else {
+                totalRetailCents = Math.max(
+                        wholesalePayoutCents + 1,
+                        (int) Math.round(wholesalePayoutCents * (DEFAULT_HOST_MARKUP_MULTIPLIER_BASIS_POINTS / 100.0))
+                );
+            }
+            if (totalRetailCents <= wholesalePayoutCents) {
+                return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                        .body(ReservationResponse.builder()
+                                .accepted(false)
+                                .status("invalid_host_price")
+                                .message("hostRetailPriceCents must exceed wholesale price by at least 1 cent to cover broker margin.")
+                                .build());
+            }
+        } else {
+            totalRetailCents = variant.getRetailPriceCents();
+        }
+        platformFeeCents = PLATFORM_FEE_PERCENT_BASIS_POINTS > 0
+                ? (int) Math.round(totalRetailCents * (PLATFORM_FEE_PERCENT_BASIS_POINTS / 10000.0))
+                : 0;
+        final int arbitrageMarginCents = totalRetailCents - wholesalePayoutCents - platformFeeCents;
+
+        if (crossStoreSplit) {
+            return handleCrossStoreRequestedFlow(
+                    request, product, originating, originatingStoreId, variant, fulfilling,
+                    totalRetailCents, wholesalePayoutCents, arbitrageMarginCents);
+        }
+
+        return handleSameStoreImmediateReserve(
+                request, product, originating, originatingStoreId, variant, fulfilling,
+                totalRetailCents, wholesalePayoutCents, arbitrageMarginCents);
+    }
+
+    private ResponseEntity<ReservationResponse> handleCrossStoreRequestedFlow(
+            ReservationRequest request,
+            Product product,
+            Store originating,
+            UUID originatingStoreId,
+            ProductVariant variant,
+            Store fulfilling,
+            int totalRetailCents,
+            int wholesalePayoutCents,
+            int arbitrageMarginCents) {
+
+        Transaction tx = Transaction.builder()
+                .originatingStoreId(originatingStoreId)
+                .fulfillingStoreId(variant.getStoreId())
+                .totalRetailCents(totalRetailCents)
+                .wholesalePayoutCents(wholesalePayoutCents)
+                .arbitrageMarginCents(arbitrageMarginCents)
+                .status(TransactionStatus.REQUESTED)
+                .productId(product.getId())
+                .variantId(variant.getId())
+                .build();
+        tx = transactionRepository.save(tx);
+
+        final OffsetDateTime now = OffsetDateTime.now();
+        UUID runnerId = assignRunnerForOriginatingStoreInline(originatingStoreId, variant.getStoreId());
+        tx.setRunnerId(runnerId);
+        tx = transactionRepository.save(tx);
+
+        String secureToken = generateSecureTokenInline(tx.getId(), runnerId, now);
+        String fallbackCode = generateFallbackCodeInline();
+        OffsetDateTime qrExpiresAt = now.plusMinutes(QR_TOKEN_TTL_MINUTES);
+
+        QrToken qrToken = QrToken.builder()
+                .transactionId(tx.getId())
+                .runnerId(runnerId)
+                .secureToken(secureToken)
+                .fallbackCode(fallbackCode)
+                .expiresAt(qrExpiresAt)
+                .build();
+        qrToken = qrTokenRepository.save(qrToken);
+
+        String productImageUrl = product.getPrimaryImageUrl() != null
+                ? product.getPrimaryImageUrl()
+                : variant.getImageUrl();
+
+        try {
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.REQUESTED)
+                    .createdAt(now)
+                    .transactionId(tx.getId())
+                    .storeId(variant.getStoreId())
+                    .fulfillingStoreId(variant.getStoreId())
+                    .originatingStoreId(originatingStoreId)
+                    .variantId(variant.getId())
+                    .productId(product.getId())
+                    .productTitle(product.getTitle())
+                    .productImageUrl(productImageUrl)
+                    .sku(variant.getSku())
+                    .retailPrice(BigDecimal.valueOf(totalRetailCents)
+                            .setScale(2, RoundingMode.UNNECESSARY)
+                            .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY))
+                    .currency("USD")
+                    .countdownSeconds(request.getCountdownSeconds() != null ? request.getCountdownSeconds() : 900)
+                    .qrFallbackCode(fallbackCode)
+                    .runnerId(runnerId != null ? runnerId.toString() : null)
+                    .status("REQUESTED")
+                    .message("Fulfilling seller request awaiting acceptance — inventory not yet held.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("Reservation cross-store: broadcast REQUESTED event failed", ex);
+        }
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(ReservationResponse.builder()
+                .accepted(true)
+                .transactionId(tx.getId())
+                .variantId(variant.getId())
+                .productTitle(product.getTitle())
+                .productImageUrl(productImageUrl)
+                .sku(variant.getSku())
+                .countdownSeconds(request.getCountdownSeconds() != null ? request.getCountdownSeconds() : 900)
+                .totalRetailCents(totalRetailCents)
+                .wholesalePayoutCents(wholesalePayoutCents)
+                .arbitrageMarginCents(arbitrageMarginCents)
+                .currency("USD")
+                .originatingStoreId(originatingStoreId)
+                .fulfillingStoreId(variant.getStoreId())
+                .qrSecureToken(secureToken)
+                .qrFallbackCode(fallbackCode)
+                .qrTokenId(qrToken.getId().toString())
+                .qrExpiresAt(qrExpiresAt.toString())
+                .runnerId(runnerId)
+                .status("awaiting_seller")
+                .message("Awaiting fulfilling store acceptance before inventory hold is created.")
+                .build());
+    }
+
+    private ResponseEntity<ReservationResponse> handleSameStoreImmediateReserve(
+            ReservationRequest request,
+            Product product,
+            Store originating,
+            UUID originatingStoreId,
+            ProductVariant variant,
+            Store fulfilling,
+            int totalRetailCents,
+            int wholesalePayoutCents,
+            int arbitrageMarginCents) {
+
         int rows = variantRepository.decrementStockWithOptimisticLock(variant.getId(), 1, variant.getVersion());
         if (rows == 0) {
             ProductVariant reloaded = variantRepository.findById(variant.getId()).orElse(null);
@@ -138,10 +290,6 @@ public class ReservationController {
                     .build());
         }
 
-        int totalRetailCents = variant.getRetailPriceCents();
-        int wholesalePayoutCents = variant.getWholesalePriceCents();
-        int arbitrageMarginCents = totalRetailCents - wholesalePayoutCents;
-
         Transaction tx = Transaction.builder()
                 .originatingStoreId(originatingStoreId)
                 .fulfillingStoreId(variant.getStoreId())
@@ -149,6 +297,8 @@ public class ReservationController {
                 .wholesalePayoutCents(wholesalePayoutCents)
                 .arbitrageMarginCents(arbitrageMarginCents)
                 .status(TransactionStatus.RESERVED)
+                .productId(product.getId())
+                .variantId(variant.getId())
                 .build();
         tx = transactionRepository.save(tx);
 
@@ -212,7 +362,7 @@ public class ReservationController {
                     .message("Item reserved — 15-minute hold for customer pickup.")
                     .build());
         } catch (Exception ex) {
-            log.warn("Reservation: broadcast RESERVED event failed", ex);
+            log.warn("Reservation same-store: broadcast RESERVED event failed", ex);
         }
 
         return ResponseEntity.status(HttpStatus.CREATED).body(ReservationResponse.builder()

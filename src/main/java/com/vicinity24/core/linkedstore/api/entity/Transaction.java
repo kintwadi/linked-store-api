@@ -70,6 +70,12 @@ public class Transaction {
     @JoinColumn(name = "runner_id", insertable = false, updatable = false)
     private UserAccount runner;
 
+    @Column(name = "product_id")
+    private UUID productId;
+
+    @Column(name = "variant_id")
+    private UUID variantId;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 

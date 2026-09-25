@@ -196,6 +196,7 @@ public class CheckoutController {
                     paramsFb.put("customer_email", request.getCustomerEmail());
                 }
 
+                assertSingleLineItemOnly(paramsFb);
                 final Session fallback = Session.create(paramsFb);
                 return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
                         .id(fallback.getId())
@@ -269,6 +270,7 @@ public class CheckoutController {
                 params.put("customer_email", request.getCustomerEmail());
             }
 
+            assertSingleLineItemOnly(params);
             final Session session = Session.create(params);
 
             return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
@@ -324,6 +326,7 @@ public class CheckoutController {
                         params2.put("customer_email", request.getCustomerEmail());
                     }
 
+                    assertSingleLineItemOnly(params2);
                     final Session fallback = Session.create(params2);
                     return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
                             .id(fallback.getId())
@@ -575,6 +578,7 @@ public class CheckoutController {
                     }
                     params.put("payment_intent_data", paymentIntentData);
                     params.put("metadata", metadata);
+                    assertSingleLineItemOnly(params);
                     final Session session = Session.create(params);
                     return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
                             .id(session.getId())
@@ -597,6 +601,7 @@ public class CheckoutController {
             }
 
             params.put("metadata", metadata);
+            assertSingleLineItemOnly(params);
             final Session session = Session.create(params);
 
             return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
@@ -809,5 +814,26 @@ public class CheckoutController {
             sb.append(SECURE_RANDOM.nextInt(10));
         }
         return sb.toString();
+    }
+
+    private static void assertSingleLineItemOnly(Map<String, Object> params) {
+        final Object raw = params.get("line_items");
+        if (!(raw instanceof List<?> list)) {
+            throw new IllegalStateException("Stripe CheckoutSession line_items must be a list. Actual: "
+                    + (raw == null ? "null" : raw.getClass().getSimpleName()));
+        }
+        if (list.size() != 1) {
+            throw new IllegalStateException("Stripe CheckoutSession must contain exactly 1 line item (retail total only; " +
+                    "wholesale/margin are post-capture transfers never surfaced to the customer). Actual size = " + list.size());
+        }
+        final Object first = list.get(0);
+        if (!(first instanceof Map<?, ?> li)) {
+            throw new IllegalStateException("Stripe CheckoutSession line_item[0] must be a Map. Got: "
+                    + (first == null ? "null" : first.getClass()));
+        }
+        final Object qty = li.get("quantity");
+        if (!(qty instanceof Number n) || n.longValue() != 1L) {
+            throw new IllegalStateException("Stripe CheckoutSession line_item quantity must be 1 (no split add-ons). Quantity = " + qty);
+        }
     }
 }

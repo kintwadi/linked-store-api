@@ -24,6 +24,12 @@ public class StoreTransactionResponse {
 
     private Integer totalAmountCents;
 
+    private Integer wholesalePayoutCents;
+
+    private Integer arbitrageMarginCents;
+
+    private Integer perspectivePriceCents;
+
     private OffsetDateTime createdAt;
 
     private Integer itemsCount;

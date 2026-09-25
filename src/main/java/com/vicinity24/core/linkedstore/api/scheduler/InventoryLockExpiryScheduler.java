@@ -38,6 +38,7 @@ public class InventoryLockExpiryScheduler {
     private int schedulerIntervalSeconds;
 
     private static final int BATCH_SIZE = 100;
+    private static final int REQUESTED_STATUS_TTL_MINUTES = 60;
 
     @Scheduled(fixedRateString = "${inventory.expiry-scheduler-seconds:30}000")
     @Transactional
@@ -48,6 +49,7 @@ public class InventoryLockExpiryScheduler {
         int totalReleased = 0;
         int totalRestored = 0;
         int totalTxExpired = 0;
+        int totalRequestedCanceled = 0;
 
         while (true) {
             List<InventoryLock> batch = inventoryLockRepository.findExpiredLocksForReleaseBatch(
@@ -82,9 +84,56 @@ public class InventoryLockExpiryScheduler {
             }
         }
 
-        if (totalReleased > 0) {
-            log.info("Inventory lock expiry sweep complete: released={} locks, restored={} stock, expired={} transactions",
-                    totalReleased, totalRestored, totalTxExpired);
+        totalRequestedCanceled = expireStaleRequestedTransactions(now);
+
+        if (totalReleased > 0 || totalRequestedCanceled > 0) {
+            log.info("Inventory lock expiry sweep complete: released={} locks, restored={} stock, expired={} RESERVED/READY transactions, canceled={} stale REQUESTED",
+                    totalReleased, totalRestored, totalTxExpired, totalRequestedCanceled);
+        }
+    }
+
+    private int expireStaleRequestedTransactions(OffsetDateTime now) {
+        final OffsetDateTime cutoff = now.minusMinutes(REQUESTED_STATUS_TTL_MINUTES);
+        int canceled = 0;
+        while (true) {
+            List<Transaction> batch = transactionRepository
+                    .findAllByStatusAndCreatedAtBeforeOrderByCreatedAtAsc(
+                            TransactionStatus.REQUESTED, cutoff,
+                            org.springframework.data.domain.PageRequest.of(0, BATCH_SIZE));
+            if (batch.isEmpty()) break;
+            for (Transaction tx : batch) {
+                int updated = transactionRepository.updateStatusIfCurrentStatusIs(
+                        tx.getId(), TransactionStatus.CANCELED, TransactionStatus.REQUESTED);
+                if (updated > 0) {
+                    canceled++;
+                    broadcastRequestedCanceled(tx);
+                }
+            }
+            if (batch.size() < BATCH_SIZE) break;
+        }
+        return canceled;
+    }
+
+    private void broadcastRequestedCanceled(Transaction tx) {
+        try {
+            eventBroadcaster.broadcast(TxEvent.builder()
+                    .type(TxEventType.FULFILLER_REJECTED)
+                    .createdAt(OffsetDateTime.now())
+                    .transactionId(tx.getId())
+                    .storeId(tx.getFulfillingStoreId())
+                    .fulfillingStoreId(tx.getFulfillingStoreId())
+                    .originatingStoreId(tx.getOriginatingStoreId())
+                    .retailPrice(tx.getTotalRetailCents() != null
+                            ? BigDecimal.valueOf(tx.getTotalRetailCents()).scaleByPowerOfTen(-2)
+                            : null)
+                    .currency("USD")
+                    .expiresAt(OffsetDateTime.now())
+                    .status(TransactionStatus.CANCELED.name())
+                    .message("Customer request expired: seller did not confirm availability within "
+                            + REQUESTED_STATUS_TTL_MINUTES + " minutes.")
+                    .build());
+        } catch (Exception ex) {
+            log.warn("broadcast CANCELED (REQUESTED expiry) failed txId={}", tx.getId(), ex);
         }
     }
 
