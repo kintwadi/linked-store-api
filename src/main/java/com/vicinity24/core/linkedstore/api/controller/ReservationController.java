@@ -49,8 +49,7 @@ public class ReservationController {
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
-    private static final int DEFAULT_HOST_MARKUP_MULTIPLIER_BASIS_POINTS = 150; // 1.50x = 150 basis points of wholesale (multiply/100)
-    private static final int PLATFORM_FEE_PERCENT_BASIS_POINTS = 0; // 0% per application.yml linkedstore.platform-fee-percent
+    private static final int PLATFORM_FEE_PERCENT_BASIS_POINTS = 0;
 
     @PostMapping("")
     @Transactional
@@ -127,35 +126,42 @@ public class ReservationController {
 
         final boolean crossStoreSplit = !originatingStoreId.equals(variant.getStoreId());
 
-        final int wholesalePayoutCents = variant.getWholesalePriceCents() != null
+        final int variantRetailCents = variant.getRetailPriceCents();
+        final int variantWholesaleCents = variant.getWholesalePriceCents() != null
                 ? variant.getWholesalePriceCents()
-                : Math.max(0, (int) Math.round(variant.getRetailPriceCents() * 0.7));
+                : Math.max(0, (int) Math.round(variantRetailCents * 0.7));
         final int totalRetailCents;
+        final int wholesalePayoutCents;
+        final int arbitrageMarginCents;
         final int platformFeeCents;
         if (crossStoreSplit) {
+            final int catalogCrossStoreTotal = variantRetailCents + variantWholesaleCents;
             if (request.getHostRetailPriceCents() != null && request.getHostRetailPriceCents() > 0) {
                 totalRetailCents = request.getHostRetailPriceCents();
             } else {
-                totalRetailCents = Math.max(
-                        wholesalePayoutCents + 1,
-                        (int) Math.round(wholesalePayoutCents * (DEFAULT_HOST_MARKUP_MULTIPLIER_BASIS_POINTS / 100.0))
-                );
+                totalRetailCents = catalogCrossStoreTotal;
             }
-            if (totalRetailCents <= wholesalePayoutCents) {
+            if (totalRetailCents <= variantRetailCents + variantWholesaleCents - 1
+                    || variantRetailCents <= 0
+                    || variantWholesaleCents <= 0) {
                 return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                         .body(ReservationResponse.builder()
                                 .accepted(false)
                                 .status("invalid_host_price")
-                                .message("hostRetailPriceCents must exceed wholesale price by at least 1 cent to cover broker margin.")
+                                .message("cross_customer_store_sell must equal retail+wholesale (" + catalogCrossStoreTotal
+                                        + "c); override must be at least that total by 1c.")
                                 .build());
             }
+            wholesalePayoutCents = variantRetailCents;
+            arbitrageMarginCents = variantWholesaleCents;
         } else {
-            totalRetailCents = variant.getRetailPriceCents();
+            totalRetailCents = variantRetailCents;
+            wholesalePayoutCents = variantWholesaleCents;
+            arbitrageMarginCents = Math.max(0, totalRetailCents - wholesalePayoutCents);
         }
         platformFeeCents = PLATFORM_FEE_PERCENT_BASIS_POINTS > 0
                 ? (int) Math.round(totalRetailCents * (PLATFORM_FEE_PERCENT_BASIS_POINTS / 10000.0))
                 : 0;
-        final int arbitrageMarginCents = totalRetailCents - wholesalePayoutCents - platformFeeCents;
 
         if (crossStoreSplit) {
             return handleCrossStoreRequestedFlow(

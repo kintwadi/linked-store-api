@@ -283,9 +283,16 @@ public class CheckoutController {
             log.warn("Split-ledger checkout create failed for tx={} ({}). Attempting fallback without declarative transfer_data" +
                     " — wholesale & margin will be issued via explicit Transfers after custody proof.", request.getTransactionId(), msg);
 
-            boolean isCapabilityError = (msg != null
-                    && msg.contains("capabilities")
-                    && (msg.contains("transfers") || msg.contains("legacy_payments") || msg.contains("crypto_transfers")));
+            boolean isCapabilityError = false;
+            if (msg != null) {
+                boolean hasCapabilityMismatch = msg.contains("capabilities")
+                        && (msg.contains("transfers") || msg.contains("legacy_payments") || msg.contains("crypto_transfers"));
+                boolean hasMissingDestination = msg.contains("No such destination")
+                        || msg.contains("resource_missing")
+                        || msg.contains("account_not_found")
+                        || msg.contains("destination");
+                isCapabilityError = hasCapabilityMismatch || hasMissingDestination;
+            }
 
             if (isCapabilityError) {
                 try {
