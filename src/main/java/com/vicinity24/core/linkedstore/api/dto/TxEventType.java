@@ -10,5 +10,7 @@ public enum TxEventType {
     PICKED_UP,
     PAID,
     CANCELLED,
-    EXPIRED
+    EXPIRED,
+    REFUND_COMPLETED,
+    REFUND_FAILED
 }
