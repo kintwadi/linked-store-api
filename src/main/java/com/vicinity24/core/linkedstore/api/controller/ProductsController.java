@@ -3,9 +3,11 @@ package com.vicinity24.core.linkedstore.api.controller;
 import com.vicinity24.core.linkedstore.api.entity.Product;
 import com.vicinity24.core.linkedstore.api.entity.ProductStatus;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
+import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.VariantStatus;
 import com.vicinity24.core.linkedstore.api.repository.ProductRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
+import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -23,12 +25,38 @@ public class ProductsController {
 
     private final ProductRepository productRepository;
     private final ProductVariantRepository variantRepository;
+    private final StoreRepository storeRepository;
+
+    private static final String DEFAULT_CURRENCY = "USD";
+
+    private String resolveCurrencyForStore(UUID storeId) {
+        if (storeId == null) return DEFAULT_CURRENCY;
+        try {
+            Optional<Store> sOpt = storeRepository.findById(storeId);
+            if (sOpt.isPresent()) {
+                Store s = sOpt.get();
+                String cc = s.getCurrencyCode();
+                if (cc != null && !cc.isBlank()) return cc.trim().toUpperCase(Locale.ROOT);
+                if (s.getCountryCode() != null && !s.getCountryCode().isBlank()) {
+                    try {
+                        Currency c = Currency.getInstance(new Locale("", s.getCountryCode().trim().toUpperCase(Locale.ROOT)));
+                        if (c != null) return c.getCurrencyCode();
+                    } catch (Exception ignore) { /* fallthrough */ }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to resolve currency for store {}", storeId, e);
+        }
+        return DEFAULT_CURRENCY;
+    }
 
     @GetMapping("")
     public List<Map<String, Object>> list() {
         List<Product> products = productRepository.findAllByStatus(ProductStatus.ACTIVE);
+        /* Resolve unique store -> currency map in one pass to avoid N+1. */
+        Map<UUID, String> storeCurrencyCache = new HashMap<>();
         return products.stream().map(p -> {
-            Map<String, Object> m = new HashMap<>();
+            Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", p.getId().toString());
             m.put("title", p.getTitle());
             m.put("description", p.getDescription());
@@ -38,13 +66,34 @@ public class ProductsController {
             m.put("status", p.getStatus());
 
             List<ProductVariant> vs = variantRepository.findByProductIdAndStatusOrderByRetailPriceCentsAsc(p.getId(), VariantStatus.ACTIVE);
+            List<Map<String, Object>> variantMaps = vs.stream().map(v -> {
+                Map<String, Object> vm = new LinkedHashMap<>();
+                vm.put("id", v.getId().toString());
+                vm.put("sku", v.getSku());
+                vm.put("retailPriceCents", v.getRetailPriceCents());
+                vm.put("wholesalePriceCents", v.getWholesalePriceCents());
+                vm.put("imageUrl", v.getImageUrl());
+                vm.put("galleryImageUrls", v.getGalleryImageUrls());
+                vm.put("stockQuantity", v.getStockQuantity());
+                vm.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
+                vm.put("variantAttributes", v.getVariantAttributes());
+                return vm;
+            }).collect(Collectors.toList());
+            m.put("variants", variantMaps);
+
             if (!vs.isEmpty()) {
                 ProductVariant v = vs.get(0);
                 m.put("retailPriceCents", v.getRetailPriceCents());
                 m.put("wholesalePriceCents", v.getWholesalePriceCents());
                 m.put("sku", v.getSku());
                 m.put("variantId", v.getId().toString());
-                m.put("storeId", v.getStoreId().toString());
+                m.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
+                String cc = v.getStoreId() != null
+                        ? storeCurrencyCache.computeIfAbsent(v.getStoreId(), this::resolveCurrencyForStore)
+                        : DEFAULT_CURRENCY;
+                m.put("currencyCode", cc);
+            } else {
+                m.put("currencyCode", DEFAULT_CURRENCY);
             }
             return m;
         }).collect(Collectors.toList());
@@ -68,14 +117,15 @@ public class ProductsController {
 
         List<ProductVariant> vs = variantRepository.findByProductIdAndStatusOrderByRetailPriceCentsAsc(p.getId(), VariantStatus.ACTIVE);
         List<Map<String, Object>> variantMaps = vs.stream().map(v -> {
-            Map<String, Object> vm = new HashMap<>();
+            Map<String, Object> vm = new LinkedHashMap<>();
             vm.put("id", v.getId().toString());
-            vm.put("sku", v.getSku());
+            vm.put("sku", v.getSku()); 
             vm.put("retailPriceCents", v.getRetailPriceCents());
             vm.put("wholesalePriceCents", v.getWholesalePriceCents());
             vm.put("imageUrl", v.getImageUrl());
+            vm.put("galleryImageUrls", v.getGalleryImageUrls());
             vm.put("stockQuantity", v.getStockQuantity());
-            vm.put("storeId", v.getStoreId().toString());
+            vm.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
             vm.put("variantAttributes", v.getVariantAttributes());
             return vm;
         }).collect(Collectors.toList());
@@ -87,7 +137,10 @@ public class ProductsController {
             m.put("wholesalePriceCents", v.getWholesalePriceCents());
             m.put("sku", v.getSku());
             m.put("variantId", v.getId().toString());
-            m.put("storeId", v.getStoreId().toString());
+            m.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
+            m.put("currencyCode", resolveCurrencyForStore(v.getStoreId()));
+        } else {
+            m.put("currencyCode", DEFAULT_CURRENCY);
         }
 
         return ResponseEntity.ok(m);
@@ -109,10 +162,12 @@ public class ProductsController {
         vm.put("retailPriceCents", v.getRetailPriceCents());
         vm.put("wholesalePriceCents", v.getWholesalePriceCents());
         vm.put("imageUrl", v.getImageUrl());
+        vm.put("galleryImageUrls", v.getGalleryImageUrls());
         vm.put("stockQuantity", v.getStockQuantity());
         vm.put("storeId", v.getStoreId() != null ? v.getStoreId().toString() : null);
         vm.put("status", v.getStatus() != null ? v.getStatus().name() : null);
         vm.put("variantAttributes", v.getVariantAttributes());
+        vm.put("currencyCode", resolveCurrencyForStore(v.getStoreId()));
         if (v.getProduct() != null) {
             Map<String, Object> pm = new LinkedHashMap<>();
             pm.put("id", v.getProduct().getId().toString());
