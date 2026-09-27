@@ -1,5 +1,6 @@
 package com.vicinity24.core.linkedstore.api.controller;
 
+import com.google.gson.Gson;
 import com.stripe.Stripe;
 import com.stripe.exception.SignatureVerificationException;
 import com.stripe.exception.StripeException;
@@ -46,7 +47,7 @@ public class ConnectController {
     private final TransactionRepository transactionRepository;
     private final CheckoutService checkoutService;
 
-    @Value("${stripe.connect.webhook-secret:}")
+    @Value("${stripe.webhook-secret:}")
     private String connectWebhookSecret;
 
     @GetMapping("/health")
@@ -117,8 +118,10 @@ public class ConnectController {
             boolean isNewAccount = false;
             String accountCountry = "US";
             if (stripeConnectId == null || stripeConnectId.isBlank() || stripeConnectId.startsWith("acct_connected_")) {
-                final String country = request.resolvedCountry();
-                final String currency = request.resolvedDefaultCurrency();
+                final String storeCountry = store.getCountryCode();
+                final String storeCurrency = store.getCurrencyCode();
+                final String country = request.resolvedCountry(storeCountry);
+                final String currency = request.resolvedDefaultCurrency(storeCurrency, storeCountry);
                 final AccountCreateParams.BusinessType businessType = parseBusinessType(request.getBusinessType());
                 final AccountCreateParams.Builder b = AccountCreateParams.builder()
                         .setType(AccountCreateParams.Type.EXPRESS)
@@ -144,6 +147,12 @@ public class ConnectController {
                 stripeConnectId = account.getId();
                 accountCountry = country;
                 store.setStripeConnectId(stripeConnectId);
+                if (store.getCountryCode() == null || store.getCountryCode().isBlank()) {
+                    store.setCountryCode(country);
+                }
+                if (store.getCurrencyCode() == null || store.getCurrencyCode().isBlank()) {
+                    store.setCurrencyCode(currency);
+                }
                 storeRepository.save(store);
                 isNewAccount = true;
                 log.info("Connect: created new Stripe Account {} for store {} ({}), country={}, currency={}",
@@ -314,9 +323,9 @@ public class ConnectController {
         final Event event;
         try {
             if (connectWebhookSecret == null || connectWebhookSecret.isBlank()) {
-                log.warn("Connect: stripe.connect.webhook-secret is not set; skipping signature verification. " +
-                        "Do NOT run this in production.");
-                event = Webhook.constructEvent(rawPayload, stripeSignature, "whsec_placeholder");
+                log.warn("Connect: STRIPE_WEBHOOK_SECRET is not set; skipping Stripe-Signature verification. " +
+                        "Do NOT run this in production — anyone can forge a webhook payload.");
+                event = new Gson().fromJson(rawPayload, Event.class);
             } else {
                 event = Webhook.constructEvent(rawPayload, stripeSignature, connectWebhookSecret);
             }
@@ -434,16 +443,28 @@ public class ConnectController {
         };
     }
 
-    static String resolveCountry(String country) {
-        return ConnectOnboardingRequest.builder().country(country).build().resolvedCountry();
+    static String resolveCountry(String country, String fallbackStoreCountry) {
+        return ConnectOnboardingRequest.builder()
+                .country(country)
+                .build()
+                .resolvedCountry(fallbackStoreCountry);
     }
 
-    static String resolveCurrencyForCountry(String country, String explicitCurrency) {
+    static String resolveCountry(String country) {
+        return resolveCountry(country, null);
+    }
+
+    static String resolveCurrencyForCountry(String country, String explicitCurrency,
+                                            String fallbackStoreCurrency, String fallbackStoreCountry) {
         return ConnectOnboardingRequest.builder()
                 .country(country)
                 .defaultCurrency(explicitCurrency)
                 .build()
-                .resolvedDefaultCurrency();
+                .resolvedDefaultCurrency(fallbackStoreCurrency, fallbackStoreCountry);
+    }
+
+    static String resolveCurrencyForCountry(String country, String explicitCurrency) {
+        return resolveCurrencyForCountry(country, explicitCurrency, null, null);
     }
 
     static LinkAttempt tryCreateAccountLink(

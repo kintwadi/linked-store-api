@@ -46,6 +46,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -58,6 +59,13 @@ public class CheckoutController {
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    static String resolveStoreCurrencyLower(Store store) {
+        if (store == null) return "usd";
+        String c = store.getCurrencyCode();
+        if (c == null || c.isBlank()) return "usd";
+        return c.trim().toLowerCase(Locale.ROOT);
+    }
 
     private final CheckoutService checkoutService;
     private final StripeConfig stripeConfig;
@@ -116,6 +124,10 @@ public class CheckoutController {
                     .build());
         }
 
+        final Store originatingStore = storeRepository.findById(tx.getOriginatingStoreId()).orElse(null);
+        final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
+        final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
+
         final boolean storeNotOnboarded = fulfillingStore.getStripeConnectId() == null
                 || fulfillingStore.getStripeConnectId().isBlank()
                 || fulfillingStore.getStripeConnectId().startsWith("acct_connected_");
@@ -165,7 +177,7 @@ public class CheckoutController {
                 productDataFb.put("name", productTitle);
                 if (!imagesFb.isEmpty()) productDataFb.put("images", imagesFb);
                 final Map<String, Object> priceDataFb = new HashMap<>();
-                priceDataFb.put("currency", "usd");
+                priceDataFb.put("currency", txCurrencyLower);
                 priceDataFb.put("unit_amount", tx.getTotalRetailCents());
                 priceDataFb.put("product_data", productDataFb);
                 final Map<String, Object> lineItemFb = new HashMap<>();
@@ -228,7 +240,7 @@ public class CheckoutController {
             }
 
             final Map<String, Object> priceData = new HashMap<>();
-            priceData.put("currency", "usd");
+            priceData.put("currency", txCurrencyLower);
             priceData.put("unit_amount", tx.getTotalRetailCents());
             priceData.put("product_data", productData);
 
@@ -302,7 +314,7 @@ public class CheckoutController {
                     productData2.put("name", productTitle);
                     if (!images2.isEmpty()) productData2.put("images", images2);
                     final Map<String, Object> priceData2 = new HashMap<>();
-                    priceData2.put("currency", "usd");
+                    priceData2.put("currency", txCurrencyLower);
                     priceData2.put("unit_amount", tx.getTotalRetailCents());
                     priceData2.put("product_data", productData2);
                     final Map<String, Object> lineItem2 = new HashMap<>();
@@ -427,6 +439,8 @@ public class CheckoutController {
                         .message("Store configuration missing for split ledger checkout.")
                         .build());
             }
+            final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
+            final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
             final Transaction transaction = Transaction.builder()
                     .originatingStoreId(originatingStoreId)
@@ -499,7 +513,7 @@ public class CheckoutController {
                         .retailPrice(BigDecimal.valueOf(retailCents)
                                 .setScale(2, RoundingMode.UNNECESSARY)
                                 .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP))
-                        .currency("USD")
+                        .currency(txCurrencyUpper)
                         .expiresAt(pickupExpiresAt)
                         .countdownSeconds(countdownSeconds)
                         .qrFallbackCode(fallbackCode)
@@ -523,7 +537,7 @@ public class CheckoutController {
             }
             if (imageUrl != null && !imageUrl.isBlank()) images.add(imageUrl);
 
-            final String currency = "USD";
+            final String currency = txCurrencyUpper;
 
             final Map<String, Object> productData = new HashMap<>();
             productData.put("name", title);

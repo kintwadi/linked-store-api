@@ -22,6 +22,9 @@ private.md
 .env
 setup.env.properties
 backend_latest.log
+webhook_url
+stripe_webhook_secret
+stripe_*secret*
 
 # OS
 .DS_Store

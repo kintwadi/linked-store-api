@@ -14,6 +14,7 @@ import com.vicinity24.core.linkedstore.api.exception.TransactionStateException;
 import com.vicinity24.core.linkedstore.api.repository.InventoryLockRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
+import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreUserRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
@@ -40,6 +41,7 @@ public class FulfillmentService {
     private final TransactionRepository transactionRepository;
     private final ProductVariantRepository productVariantRepository;
     private final InventoryLockRepository inventoryLockRepository;
+    private final StoreRepository storeRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
 
     private static final Set<StoreUserRole> FULFILLMENT_SCAN_ROLES =
@@ -202,6 +204,15 @@ public class FulfillmentService {
                     }
                 }
             }
+            String txCurrencyUpper = "USD";
+            if (fulfillingStoreId != null) {
+                Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+                if (fOpt.isPresent() && fOpt.get().getCurrencyCode() != null
+                        && !fOpt.get().getCurrencyCode().isBlank()) {
+                    txCurrencyUpper = fOpt.get().getCurrencyCode().trim().toUpperCase(java.util.Locale.ROOT);
+                    if (txCurrencyUpper.length() != 3) txCurrencyUpper = "USD";
+                }
+            }
             eventBroadcaster.broadcast(TxEvent.builder()
                     .type(TxEventType.PICKED_UP)
                     .createdAt(now)
@@ -215,7 +226,7 @@ public class FulfillmentService {
                     .productImageUrl(productImageUrl)
                     .sku(sku)
                     .retailPrice(price)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .status(TransactionStatus.PICKED_UP.name())
                     .runnerId(qrToken.getRunnerId() != null ? qrToken.getRunnerId().toString() : null)
                     .qrFallbackCode(qrToken.getFallbackCode())

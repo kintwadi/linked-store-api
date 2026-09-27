@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -121,6 +122,7 @@ public class TransactionController {
         String qrSecureToken = qrToken != null ? qrToken.getSecureToken() : null;
         String qrFallbackCode = qrToken != null ? qrToken.getFallbackCode() : null;
 
+        String txCurrencyUpper = resolveTxCurrencyUpper(tx.getFulfillingStoreId());
         return TransactionResponse.builder()
                 .id(tx.getId())
                 .status(tx.getStatus().name())
@@ -132,7 +134,7 @@ public class TransactionController {
                 .totalRetailCents(tx.getTotalRetailCents())
                 .wholesalePayoutCents(tx.getWholesalePayoutCents())
                 .arbitrageMarginCents(tx.getArbitrageMarginCents())
-                .currency("USD")
+                .currency(txCurrencyUpper)
                 .productId(productId)
                 .productTitle(productTitle)
                 .productImageUrl(productImageUrl)
@@ -144,5 +146,15 @@ public class TransactionController {
                 .createdAt(tx.getCreatedAt() != null ? tx.getCreatedAt().toString() : null)
                 .updatedAt(tx.getUpdatedAt() != null ? tx.getUpdatedAt().toString() : null)
                 .build();
+    }
+
+    private String resolveTxCurrencyUpper(UUID fulfillingStoreId) {
+        if (fulfillingStoreId == null) return "USD";
+        Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+        if (fOpt.isEmpty()) return "USD";
+        String cc = fOpt.get().getCurrencyCode();
+        if (cc == null || cc.isBlank()) return "USD";
+        String up = cc.trim().toUpperCase(Locale.ROOT);
+        return up.length() == 3 ? up : "USD";
     }
 }

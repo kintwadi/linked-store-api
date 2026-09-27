@@ -49,6 +49,8 @@ stripe:
   public-key: ${STRIPE_PUBLIC_KEY:pk_test_placeholder}
   webhook-secret: ${STRIPE_WEBHOOK_SECRET:whsec_placeholder}
   platform-fee-percent: 0
+  connect:
+    webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
   subscription:
     plus-price-id: ${SUBSCRIPTION_PLUS_STRIPE_PRICE_ID:}
     pro-price-id: ${SUBSCRIPTION_PRO_STRIPE_PRICE_ID:}
@@ -95,7 +97,7 @@ server:
     context-path: /
 
 seed:
-  catalog: true
+  catalog: false
 
 linkedstore:
   auth:

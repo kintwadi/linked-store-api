@@ -67,18 +67,32 @@ public class ConnectOnboardingRequest {
             Map.entry("HR", "HRK")
     );
 
-    public String resolvedCountry() {
-        String c = (country != null) ? country.trim().toUpperCase(Locale.ROOT) : "US";
+    public String resolvedCountry(String fallbackCountry) {
+        String c = (country != null && !country.isBlank())
+                ? country.trim().toUpperCase(Locale.ROOT)
+                : (fallbackCountry != null ? fallbackCountry.trim().toUpperCase(Locale.ROOT) : "US");
         return SUPPORTED_COUNTRIES.contains(c) ? c : "US";
     }
 
-    public String resolvedDefaultCurrency() {
+    public String resolvedCountry() {
+        return resolvedCountry(null);
+    }
+
+    public String resolvedDefaultCurrency(String fallbackCurrency, String fallbackCountry) {
         if (defaultCurrency != null && !defaultCurrency.isBlank()) {
             String c = defaultCurrency.trim().toUpperCase(Locale.ROOT);
             if (c.length() == 3) return c;
         }
-        String cc = resolvedCountry();
+        if (fallbackCurrency != null && !fallbackCurrency.isBlank()) {
+            String c = fallbackCurrency.trim().toUpperCase(Locale.ROOT);
+            if (c.length() == 3) return c;
+        }
+        String cc = resolvedCountry(fallbackCountry);
         return COUNTRY_CURRENCY.getOrDefault(cc, "EUR");
+    }
+
+    public String resolvedDefaultCurrency() {
+        return resolvedDefaultCurrency(null, null);
     }
 }
 

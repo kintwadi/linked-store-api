@@ -30,6 +30,7 @@ import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -53,6 +54,13 @@ public class CheckoutService {
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    private static String resolveStoreCurrencyLower(Store store) {
+        if (store == null) return "usd";
+        String c = store.getCurrencyCode();
+        if (c == null || c.isBlank()) return "usd";
+        return c.trim().toLowerCase(Locale.ROOT);
+    }
 
     @Transactional
     public CheckoutPayResponse processPayment(CheckoutPayRequest request) {
@@ -107,13 +115,15 @@ public class CheckoutService {
         int wholesalePayoutCents = transaction.getWholesalePayoutCents();
         int marginCents = transaction.getArbitrageMarginCents();
         int platformFeeCents = 0;
+        final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
+        final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
         PaymentProvider paymentProvider = paymentProviderFactory.getProvider(request.getPaymentProvider());
         PaymentResponse paymentIntent;
         try {
             paymentIntent = capturePaymentWithProvider(
                     paymentProvider, request, totalCents, transferGroup,
-                    originatingStore, fulfillingStore);
+                    originatingStore, fulfillingStore, txCurrencyLower);
         } catch (StripePaymentFailedException e) {
             log.error("Provider {} payment capture failed for tx={}",
                     paymentProvider.providerId(), transactionId, e);
@@ -134,7 +144,8 @@ public class CheckoutService {
                     wholesalePayoutCents,
                     marginCents,
                     originatingStore.getStripeConnectId(),
-                    fulfillingStore.getStripeConnectId());
+                    fulfillingStore.getStripeConnectId(),
+                    txCurrencyLower);
         } catch (StripePaymentFailedException e) {
             log.error("Provider {} split payouts failed for tx={}, payment_intent={}",
                     paymentProvider.providerId(), transactionId, paymentIntent.getPaymentIntentId(), e);
@@ -207,7 +218,7 @@ public class CheckoutService {
                     .productImageUrl(productImageUrl)
                     .sku(sku)
                     .retailPrice(price)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(qrExpiresAt)
                     .qrFallbackCode(fallbackCode)
                     .runnerId(runnerId != null ? runnerId.toString() : null)
@@ -241,7 +252,8 @@ public class CheckoutService {
             int totalCents,
             String transferGroup,
             Store originatingStore,
-            Store fulfillingStore) {
+            Store fulfillingStore,
+            String currencyLower) {
 
         String description = "Linked-Store Purchase | tx_" + request.getTransactionId();
         PaymentRequest paymentRequest = PaymentRequest.builder()
@@ -250,7 +262,7 @@ public class CheckoutService {
                 .customerEmail(request.getCustomerEmail())
                 .idempotencyKey(request.getIdempotencyKey())
                 .amountCents(totalCents)
-                .currency("usd")
+                .currency(currencyLower != null ? currencyLower : "usd")
                 .description(description)
                 .transferGroup(transferGroup)
                 .confirm(true)
@@ -269,13 +281,16 @@ public class CheckoutService {
             int wholesalePayoutCents,
             int marginCents,
             String originatingStripeConnectId,
-            String fulfillingStripeConnectId) {
+            String fulfillingStripeConnectId,
+            String currencyLower) {
+
+        final String currency = currencyLower != null ? currencyLower : "usd";
 
         if (wholesalePayoutCents > 0) {
             PayoutRequest pr = PayoutRequest.builder()
                     .provider(provider.providerId())
                     .amountCents(wholesalePayoutCents)
-                    .currency("usd")
+                    .currency(currency)
                     .destinationAccountId(fulfillingStripeConnectId)
                     .transferGroup(transferGroup)
                     .route("WHOLESALE_TO_FULFILLING")
@@ -289,7 +304,7 @@ public class CheckoutService {
             PayoutRequest pr = PayoutRequest.builder()
                     .provider(provider.providerId())
                     .amountCents(marginCents)
-                    .currency("usd")
+                    .currency(currency)
                     .destinationAccountId(originatingStripeConnectId)
                     .transferGroup(transferGroup)
                     .route("MARGIN_TO_ORIGINATING")
@@ -398,6 +413,8 @@ public class CheckoutService {
         final UUID fulfillStoreId = tx.getFulfillingStoreId();
         final Store originatingStore = origStoreId != null ? storeRepository.findById(origStoreId).orElse(null) : null;
         final Store fulfillingStore = fulfillStoreId != null ? storeRepository.findById(fulfillStoreId).orElse(null) : null;
+        final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
+        final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
         if (doExplicitPayouts && originatingStore != null && fulfillingStore != null) {
             try {
@@ -410,7 +427,8 @@ public class CheckoutService {
                         wholesale,
                         margin,
                         originatingStore.getStripeConnectId(),
-                        fulfillingStore.getStripeConnectId());
+                        fulfillingStore.getStripeConnectId(),
+                        txCurrencyLower);
             } catch (Exception ex) {
                 log.error("finalizePaidAfterStripe: explicit split payouts failed tx={}", transactionId, ex);
             }
@@ -495,7 +513,7 @@ public class CheckoutService {
                     .productImageUrl(productImageUrl)
                     .sku(sku)
                     .retailPrice(price)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(expiresAt)
                     .qrFallbackCode(fbCode)
                     .runnerId(finalRunnerId2 != null ? finalRunnerId2.toString() : null)

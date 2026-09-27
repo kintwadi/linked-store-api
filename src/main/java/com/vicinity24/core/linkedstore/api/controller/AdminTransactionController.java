@@ -21,6 +21,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.*;
+import java.util.Locale;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -390,6 +391,7 @@ public class AdminTransactionController {
             }
         }
 
+        String txCurrencyUpper = resolveTxCurrencyUpper(tx.getFulfillingStoreId());
         return TransactionResponse.builder()
                 .id(tx.getId())
                 .status(tx.getStatus().name())
@@ -401,7 +403,7 @@ public class AdminTransactionController {
                 .totalRetailCents(tx.getTotalRetailCents())
                 .wholesalePayoutCents(tx.getWholesalePayoutCents())
                 .arbitrageMarginCents(tx.getArbitrageMarginCents())
-                .currency("USD")
+                .currency(txCurrencyUpper)
                 .productId(productId)
                 .productTitle(productTitle)
                 .productImageUrl(productImageUrl)
@@ -417,5 +419,15 @@ public class AdminTransactionController {
                 .perspectiveRole(perspectiveRole)
                 .perspectiveStoreId(perspectiveStoreId)
                 .build();
+    }
+
+    private String resolveTxCurrencyUpper(UUID fulfillingStoreId) {
+        if (fulfillingStoreId == null) return "USD";
+        Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+        if (fOpt.isEmpty()) return "USD";
+        String cc = fOpt.get().getCurrencyCode();
+        if (cc == null || cc.isBlank()) return "USD";
+        String up = cc.trim().toUpperCase(Locale.ROOT);
+        return up.length() == 3 ? up : "USD";
     }
 }

@@ -693,8 +693,10 @@ public class AdminStoreController {
                         : ("store-" + store.getId() + "@vicinity24.dev");
                 String reqCountry = body != null ? body.get("country") : null;
                 String reqCurrency = body != null ? body.get("defaultCurrency") : null;
-                final String country = ConnectController.resolveCountry(reqCountry);
-                final String currency = ConnectController.resolveCurrencyForCountry(reqCountry, reqCurrency);
+                final String storeCountry = store.getCountryCode();
+                final String storeCurrency = store.getCurrencyCode();
+                final String country = ConnectController.resolveCountry(reqCountry, storeCountry);
+                final String currency = ConnectController.resolveCurrencyForCountry(reqCountry, reqCurrency, storeCurrency, storeCountry);
                 final AccountCreateParams.BusinessType businessType = ConnectController.parseBusinessType(
                         body != null ? body.get("businessType") : null);
                 AccountCreateParams.Builder b = AccountCreateParams.builder()
@@ -716,6 +718,12 @@ public class AdminStoreController {
                 Account account = Account.create(b.build());
                 stripeConnectId = account.getId();
                 store.setStripeConnectId(stripeConnectId);
+                if (store.getCountryCode() == null || store.getCountryCode().isBlank()) {
+                    store.setCountryCode(country);
+                }
+                if (store.getCurrencyCode() == null || store.getCurrencyCode().isBlank()) {
+                    store.setCurrencyCode(currency);
+                }
                 storeRepository.save(store);
                 isNewAccount = true;
                 log.info("AdminConnect: created new Stripe Account {} for store {} ({}), country={}, currency={}",
@@ -1122,14 +1130,16 @@ public class AdminStoreController {
         String fallbackCode = null;
         String runnerId = null;
         BigDecimal price = null;
-        String currency = "USD";
+        String currency = resolveTxCurrencyUpperForStore(tx.getFulfillingStoreId());
         if (txr != null) {
             variantId = txr.getVariantId();
             productId = txr.getProductId();
             productTitle = txr.getProductTitle();
             productImageUrl = txr.getProductImageUrl();
             sku = txr.getSku();
-            currency = txr.getCurrency();
+            if (txr.getCurrency() != null && !txr.getCurrency().isBlank()) {
+                currency = txr.getCurrency();
+            }
             if (txr.getTotalRetailCents() != null) {
                 price = BigDecimal.valueOf(txr.getTotalRetailCents()).scaleByPowerOfTen(-2);
             }
@@ -1174,11 +1184,21 @@ public class AdminStoreController {
                 .productImageUrl(productImageUrl)
                 .sku(sku)
                 .retailPrice(price)
-                .currency(currency == null ? "USD" : currency)
+                .currency(currency)
                 .expiresAt(expiresAt)
                 .status(tx.getStatus() != null ? tx.getStatus().name() : null)
                 .message(message)
                 .build();
+    }
+
+    private String resolveTxCurrencyUpperForStore(UUID fulfillingStoreId) {
+        if (fulfillingStoreId == null) return "USD";
+        Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+        if (fOpt.isEmpty()) return "USD";
+        String cc = fOpt.get().getCurrencyCode();
+        if (cc == null || cc.isBlank()) return "USD";
+        String up = cc.trim().toUpperCase(java.util.Locale.ROOT);
+        return up.length() == 3 ? up : "USD";
     }
 
     private Map<String,Object> buildTxEventResponseOrEmpty(Transaction tx) {

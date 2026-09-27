@@ -32,6 +32,7 @@ import org.springframework.web.bind.annotation.*;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -48,6 +49,13 @@ public class PickupController {
     private final InventoryLockRepository inventoryLockRepository;
     private final ProductVariantRepository productVariantRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
+
+    private static String resolveStoreCurrencyLower(Store store) {
+        if (store == null) return "usd";
+        String c = store.getCurrencyCode();
+        if (c == null || c.isBlank()) return "usd";
+        return c.trim().toLowerCase(Locale.ROOT);
+    }
 
     @PostMapping("/verify")
     @Transactional
@@ -112,6 +120,10 @@ public class PickupController {
                     .build());
         }
 
+        final Store fulfilling = storeRepository.findById(tx.getFulfillingStoreId()).orElse(null);
+        final String txCurrencyLower = resolveStoreCurrencyLower(fulfilling);
+        final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
+
         boolean justPickedUp = false;
         if (tx.getStatus() != TransactionStatus.PICKED_UP) {
             tx.setStatus(TransactionStatus.PICKED_UP);
@@ -153,7 +165,7 @@ public class PickupController {
                         .productImageUrl(productImageUrl)
                         .sku(sku)
                         .retailPrice(retailPrice)
-                        .currency("USD")
+                        .currency(txCurrencyUpper)
                         .expiresAt(expiresAt)
                         .status(tx.getStatus().name())
                         .message("Customer picked up order from store.")
@@ -178,7 +190,7 @@ public class PickupController {
             try {
                 final TransferCreateParams params = TransferCreateParams.builder()
                         .setAmount(Long.valueOf(marginCents))
-                        .setCurrency("usd")
+                        .setCurrency(txCurrencyLower)
                         .setDestination(originating.getStripeConnectId())
                         .setTransferGroup("tx_" + tx.getId())
                         .build();
@@ -202,7 +214,7 @@ public class PickupController {
                 .transactionId(tx.getId())
                 .transactionStatus(tx.getStatus().name())
                 .arbitrageMarginCents(marginCents)
-                .currency("USD")
+                .currency(txCurrencyUpper)
                 .stripeTransferId(transferId)
                 .qrScannedAt(qrScannedAt)
                 .message(message);

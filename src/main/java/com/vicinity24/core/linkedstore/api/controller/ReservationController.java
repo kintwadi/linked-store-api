@@ -27,6 +27,7 @@ import java.security.SecureRandom;
 import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -219,6 +220,7 @@ public class ReservationController {
                 ? product.getPrimaryImageUrl()
                 : variant.getImageUrl();
 
+        String txCurrencyUpper = resolveTxCurrencyUpper(variant.getStoreId());
         try {
             eventBroadcaster.broadcast(TxEvent.builder()
                     .type(TxEventType.REQUESTED)
@@ -235,7 +237,7 @@ public class ReservationController {
                     .retailPrice(BigDecimal.valueOf(totalRetailCents)
                             .setScale(2, RoundingMode.UNNECESSARY)
                             .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY))
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .countdownSeconds(request.getCountdownSeconds() != null ? request.getCountdownSeconds() : 900)
                     .qrFallbackCode(fallbackCode)
                     .runnerId(runnerId != null ? runnerId.toString() : null)
@@ -257,7 +259,7 @@ public class ReservationController {
                 .totalRetailCents(totalRetailCents)
                 .wholesalePayoutCents(wholesalePayoutCents)
                 .arbitrageMarginCents(arbitrageMarginCents)
-                .currency("USD")
+                .currency(txCurrencyUpper)
                 .originatingStoreId(originatingStoreId)
                 .fulfillingStoreId(variant.getStoreId())
                 .qrSecureToken(secureToken)
@@ -343,6 +345,7 @@ public class ReservationController {
                 : variant.getImageUrl();
 
         final OffsetDateTime pickupExpiresAt = lock.getExpiresAt();
+        String txCurrencyUpper = resolveTxCurrencyUpper(variant.getStoreId());
         try {
             eventBroadcaster.broadcast(TxEvent.builder()
                     .type(TxEventType.RESERVED)
@@ -359,7 +362,7 @@ public class ReservationController {
                     .retailPrice(BigDecimal.valueOf(totalRetailCents)
                             .setScale(2, RoundingMode.UNNECESSARY)
                             .divide(BigDecimal.valueOf(100), 2, RoundingMode.UNNECESSARY))
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(pickupExpiresAt)
                     .countdownSeconds(countdownSeconds)
                     .qrFallbackCode(fallbackCode)
@@ -383,7 +386,7 @@ public class ReservationController {
                 .totalRetailCents(totalRetailCents)
                 .wholesalePayoutCents(wholesalePayoutCents)
                 .arbitrageMarginCents(arbitrageMarginCents)
-                .currency("USD")
+                .currency(txCurrencyUpper)
                 .originatingStoreId(originatingStoreId)
                 .fulfillingStoreId(variant.getStoreId())
                 .qrSecureToken(secureToken)
@@ -558,6 +561,16 @@ public class ReservationController {
         }
     }
 
+    private String resolveTxCurrencyUpper(UUID fulfillingStoreId) {
+        if (fulfillingStoreId == null) return "USD";
+        Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+        if (fOpt.isEmpty()) return "USD";
+        String cc = fOpt.get().getCurrencyCode();
+        if (cc == null || cc.isBlank()) return "USD";
+        String up = cc.trim().toUpperCase(Locale.ROOT);
+        return up.length() == 3 ? up : "USD";
+    }
+
     @PostMapping("/{txId}/cancel")
     @Transactional
     public ResponseEntity<?> cancelReservation(@PathVariable("txId") String txIdStr) {
@@ -608,6 +621,7 @@ public class ReservationController {
                     if (productImageUrl == null) productImageUrl = v.getImageUrl();
                 }
             }
+            String txCurrencyUpper = resolveTxCurrencyUpper(tx.getFulfillingStoreId());
             eventBroadcaster.broadcast(TxEvent.builder()
                     .type(TxEventType.CANCELLED)
                     .createdAt(OffsetDateTime.now())
@@ -620,7 +634,7 @@ public class ReservationController {
                     .productImageUrl(productImageUrl)
                     .sku(sku)
                     .retailPrice(price)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(expiresAt)
                     .status(tx.getStatus().name())
                     .message("Customer cancelled the reservation.")

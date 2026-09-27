@@ -5,10 +5,12 @@ import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.InventoryLock;
 import com.vicinity24.core.linkedstore.api.entity.InventoryLockStatus;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
+import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
 import com.vicinity24.core.linkedstore.api.repository.InventoryLockRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
+import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +23,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -32,6 +36,7 @@ public class InventoryLockExpiryScheduler {
     private final InventoryLockRepository inventoryLockRepository;
     private final ProductVariantRepository variantRepository;
     private final TransactionRepository transactionRepository;
+    private final StoreRepository storeRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
 
     @Value("${inventory.expiry-scheduler-seconds:30}")
@@ -116,6 +121,7 @@ public class InventoryLockExpiryScheduler {
 
     private void broadcastRequestedCanceled(Transaction tx) {
         try {
+            String txCurrencyUpper = resolveTxCurrencyUpper(tx.getFulfillingStoreId());
             eventBroadcaster.broadcast(TxEvent.builder()
                     .type(TxEventType.FULFILLER_REJECTED)
                     .createdAt(OffsetDateTime.now())
@@ -126,7 +132,7 @@ public class InventoryLockExpiryScheduler {
                     .retailPrice(tx.getTotalRetailCents() != null
                             ? BigDecimal.valueOf(tx.getTotalRetailCents()).scaleByPowerOfTen(-2)
                             : null)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(OffsetDateTime.now())
                     .status(TransactionStatus.CANCELED.name())
                     .message("Customer request expired: seller did not confirm availability within "
@@ -135,6 +141,16 @@ public class InventoryLockExpiryScheduler {
         } catch (Exception ex) {
             log.warn("broadcast CANCELED (REQUESTED expiry) failed txId={}", tx.getId(), ex);
         }
+    }
+
+    private String resolveTxCurrencyUpper(UUID fulfillingStoreId) {
+        if (fulfillingStoreId == null) return "USD";
+        Optional<Store> fOpt = storeRepository.findById(fulfillingStoreId);
+        if (fOpt.isEmpty()) return "USD";
+        String cc = fOpt.get().getCurrencyCode();
+        if (cc == null || cc.isBlank()) return "USD";
+        String up = cc.trim().toUpperCase(Locale.ROOT);
+        return up.length() == 3 ? up : "USD";
     }
 
     private void processExpiredLock(InventoryLock lock,
@@ -207,6 +223,7 @@ public class InventoryLockExpiryScheduler {
             BigDecimal retailPrice = variant != null && variant.getRetailPriceCents() != null
                     ? BigDecimal.valueOf(variant.getRetailPriceCents()).scaleByPowerOfTen(-2)
                     : null;
+            String txCurrencyUpper = resolveTxCurrencyUpper(tx.getFulfillingStoreId());
 
             TxEvent ev = TxEvent.builder()
                     .type(TxEventType.EXPIRED)
@@ -221,7 +238,7 @@ public class InventoryLockExpiryScheduler {
                     .productImageUrl(productImageUrl)
                     .sku(sku)
                     .retailPrice(retailPrice)
-                    .currency("USD")
+                    .currency(txCurrencyUpper)
                     .expiresAt(OffsetDateTime.now())
                     .status(TransactionStatus.EXPIRED.name())
                     .message("Customer request expired: item hold timed out and inventory has been returned to shelf.")
