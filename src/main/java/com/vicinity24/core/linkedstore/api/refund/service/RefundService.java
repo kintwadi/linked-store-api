@@ -19,6 +19,7 @@ import com.vicinity24.core.linkedstore.api.refund.entity.Refund;
 import com.vicinity24.core.linkedstore.api.refund.entity.RefundStatus;
 import com.vicinity24.core.linkedstore.api.refund.repository.RefundRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.returns.service.ReturnedInspectionService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -46,6 +47,7 @@ public class RefundService {
     private final RefundRepository refundRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
     private final ObjectMapper objectMapper;
+    private final ReturnedInspectionService returnedInspectionService;
     private final String stripeSecretKey;
 
     public RefundService(
@@ -53,12 +55,14 @@ public class RefundService {
             RefundRepository refundRepository,
             TransactionEventBroadcaster eventBroadcaster,
             ObjectMapper objectMapper,
+            ReturnedInspectionService returnedInspectionService,
             @Value("${stripe.secret-key:}") String stripeSecretKey
     ) {
         this.transactionRepository = transactionRepository;
         this.refundRepository = refundRepository;
         this.eventBroadcaster = eventBroadcaster;
         this.objectMapper = objectMapper;
+        this.returnedInspectionService = returnedInspectionService;
         this.stripeSecretKey = stripeSecretKey;
     }
 
@@ -263,7 +267,7 @@ public class RefundService {
         refund.setStatus(RefundStatus.COMPLETED);
         refund.setCompletedAt(OffsetDateTime.now());
         refund = refundRepository.save(refund);
-
+        try { returnedInspectionService.createInspectionRecordIfNotExists(refund, tx); } catch (Exception ex) { log.error("Failed to create inspection record after refund id={}, txId={}: {}", refund.getId(), tx.getId(), ex.getMessage()); }
         broadcastRefundCompleted(tx, refund);
 
         return refund;
