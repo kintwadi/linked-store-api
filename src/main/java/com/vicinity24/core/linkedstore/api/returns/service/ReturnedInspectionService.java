@@ -234,6 +234,26 @@ public class ReturnedInspectionService {
         );
     }
 
+    public InspectionSummaryResponse findById(UUID recordId, Authentication auth) {
+        CurrentUser current = authFacade.current();
+        boolean isAdmin = current.isGlobalAdmin();
+        UUID callerStoreId = current.getStoreId();
+
+        ReturnedInspectionRecord record = repo.findById(recordId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Inspection record not found: " + recordId));
+
+        if (!isAdmin) {
+            if (callerStoreId == null
+                    || (!callerStoreId.equals(record.getFulfillingStoreId())
+                        && !callerStoreId.equals(record.getOriginatingStoreId()))) {
+                throw new ResponseStatusException(HttpStatus.FORBIDDEN,
+                        "Only Global Admin or related store can view this inspection.");
+            }
+        }
+
+        return buildSingleDto(record, isAdmin, callerStoreId);
+    }
+
     public InspectionSummaryResponse approve(UUID recordId, String notesOrNull, Authentication auth) {
         CurrentUser current = authFacade.current();
         boolean isAdmin = current.isGlobalAdmin();
