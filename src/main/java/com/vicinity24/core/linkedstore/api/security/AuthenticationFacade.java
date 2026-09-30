@@ -63,6 +63,10 @@ public class AuthenticationFacade {
         permissionService.ensureAtLeastRole(current(), minimum);
     }
 
+    public void requireCanManageSubscription(UUID targetStoreId) {
+        permissionService.ensureCanManageSubscription(current(), targetStoreId);
+    }
+
     private static CurrentUser anonymous() {
         return CurrentUser.builder()
                 .authenticated(false)

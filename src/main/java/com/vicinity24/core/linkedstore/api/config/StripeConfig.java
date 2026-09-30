@@ -38,6 +38,9 @@ public class StripeConfig {
     @Value("${stripe.subscription.pro-price-id:}")
     private String subscriptionProPriceId;
 
+    @Value("${stripe.public-origin:}")
+    private String publicOrigin;
+
     @PostConstruct
     public void init() {
         Stripe.apiKey = stripeApiKey;

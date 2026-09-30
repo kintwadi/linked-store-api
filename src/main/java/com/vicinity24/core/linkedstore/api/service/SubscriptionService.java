@@ -1,5 +1,8 @@
 package com.vicinity24.core.linkedstore.api.service;
 
+import com.stripe.Stripe;
+import com.stripe.exception.StripeException;
+import com.stripe.param.SubscriptionUpdateParams;
 import com.vicinity24.core.linkedstore.api.config.BrandProperties;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.entity.*;
@@ -137,21 +140,89 @@ public class SubscriptionService {
     @Transactional
     public Subscription cancelAtPeriodEnd(UUID storeId) {
         Store store = storeExists(storeId);
-        Subscription current = subscriptionRepository.findFirstByStoreIdOrderByCreatedAtDesc(storeId)
+
+        Subscription current = subscriptionRepository
+                .findFirstByStoreIdOrderByCreatedAtDesc(storeId)
+                .or(() -> {
+                    if (store.getActiveSubscription() != null) {
+                        return Optional.of(store.getActiveSubscription());
+                    }
+                    // Build a bare-bones local subscription row from the Store column state
+                    // so idempotent cancellation can still proceed even if webhook missed it.
+                    Subscription bare = Subscription.builder()
+                            .storeId(storeId)
+                            .plan(resolvePlanOrDefault(null))
+                            .status(store.getSubscriptionStatus() != null ? store.getSubscriptionStatus() : SubscriptionStatus.ACTIVE)
+                            .provider("STRIPE")
+                            .build();
+                    return Optional.of(subscriptionRepository.save(bare));
+                })
                 .orElseThrow(() -> new ResourceNotFoundException("Active Subscription for Store", storeId.toString()));
 
         if (Boolean.TRUE.equals(current.getCancelAtPeriodEnd())) {
             return current;
         }
+
+        if (current.getProviderSubscriptionId() != null
+                && !current.getProviderSubscriptionId().isBlank()
+                && isStripe(current.getProvider())) {
+            applyStripeCancelAtPeriodEnd(current);
+        }
+
         current.setCancelAtPeriodEnd(true);
         current.setCanceledAt(OffsetDateTime.now());
         subscriptionRepository.save(current);
 
-        store.setSubscriptionStatus(current.getStatus());
+        if (store.getActiveSubscription() == null || !store.getActiveSubscription().getId().equals(current.getId())) {
+            store.setActiveSubscription(current);
+        }
+        store.setSubscriptionStatus(current.getStatus() != null ? current.getStatus() : store.getSubscriptionStatus());
         storeRepository.save(store);
 
         log.info("Subscription marked cancel-at-period-end: store={} sub={}", storeId, current.getId());
         return current;
+    }
+
+    private SubscriptionPlan resolvePlanOrDefault(String tierCode) {
+        if (tierCode != null && !tierCode.isBlank()) {
+            Optional<SubscriptionPlan> p = planRepository
+                    .findByPlanCode(tierCode.trim().toUpperCase());
+            if (p.isPresent()) return p.get();
+        }
+        return planRepository
+                .findByPlanCode("PRO")
+                .or(() -> planRepository.findByPlanCode("PLUS"))
+                .orElse(null);
+    }
+
+    private static boolean isStripe(String provider) {
+        return provider != null && PaymentProviderFactory.PROVIDER_STRIPE.equalsIgnoreCase(provider);
+    }
+
+    private void applyStripeCancelAtPeriodEnd(Subscription subscription) {
+        String key = stripeConfig.getStripeApiKey();
+        if (key == null || key.isBlank()) {
+            log.warn("Stripe secret key missing, cannot mark provider subscription cancel_at_period_end: sub={}", subscription.getId());
+            return;
+        }
+        String prev = Stripe.apiKey;
+        try {
+            Stripe.apiKey = key;
+            SubscriptionUpdateParams params = SubscriptionUpdateParams.builder()
+                    .setCancelAtPeriodEnd(true)
+                    .build();
+            com.stripe.model.Subscription resource =
+                    com.stripe.model.Subscription.retrieve(subscription.getProviderSubscriptionId());
+            resource.update(params);
+            log.info("Stripe subscription cancel_at_period_end=true: providerSub={}", subscription.getProviderSubscriptionId());
+        } catch (StripeException ex) {
+            log.error("Failed to mark Stripe subscription cancel_at_period_end: sub={} providerSub={} error={}",
+                    subscription.getId(), subscription.getProviderSubscriptionId(), ex.getMessage(), ex);
+            throw new IllegalStateException(
+                    "Could not cancel subscription with Stripe. Please try again or contact support.", ex);
+        } finally {
+            Stripe.apiKey = prev;
+        }
     }
 
     public Map<String, Object> getPublicConfig() {
