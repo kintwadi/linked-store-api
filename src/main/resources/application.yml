@@ -1,6 +1,6 @@
 spring:
   application:
-    name: linked-store-backend
+    name: Linked Store
 
   datasource:
     url: jdbc:postgresql://localhost:5432/linked_store
@@ -100,6 +100,8 @@ seed:
   catalog: false
 
 linkedstore:
+  brand:
+    display-name: ${LINKEDSTORE_BRAND_DISPLAY_NAME:Linked-Store}
   auth:
     jwt-secret: ${LINKEDSTORE_AUTH_JWT_SECRET:linked-store-dev-super-secret-key-please-change-in-production-64chars-Minimum!!OK}
     access-token-minutes: ${LINKEDSTORE_AUTH_ACCESS_TOKEN_MINUTES:30}

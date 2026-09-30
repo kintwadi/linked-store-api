@@ -1,5 +1,6 @@
 package com.vicinity24.core.linkedstore.api.service;
 
+import com.vicinity24.core.linkedstore.api.config.BrandProperties;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.exception.*;
@@ -25,6 +26,7 @@ public class SubscriptionService {
     private final StoreRepository storeRepository;
     private final PaymentProviderFactory paymentProviderFactory;
     private final StripeConfig stripeConfig;
+    private final BrandProperties brandProperties;
 
     public List<SubscriptionPlan> listPlans() {
         return planRepository.findByIsActiveTrueOrderByPriceCentsAsc();
@@ -53,8 +55,8 @@ public class SubscriptionService {
         SubscriptionPlan plan = requirePlanByCode(planCode);
 
         PaymentProvider paymentProvider = paymentProviderFactory.getProvider(provider);
-        String description = "Linked-Store Subscription (%s) for store %s".formatted(
-                plan.getPlanCode(), store.getId());
+        String description = "%s Subscription (%s) for store %s".formatted(
+                brandProperties.getDisplayName(), plan.getPlanCode(), store.getId());
         PaymentRequest request = PaymentRequest.builder()
                 .provider(paymentProvider.providerId())
                 .paymentMethodId(paymentMethodId)
@@ -154,6 +156,9 @@ public class SubscriptionService {
 
     public Map<String, Object> getPublicConfig() {
         Map<String, Object> body = new LinkedHashMap<>();
+        body.put("brand", Map.of(
+                "display_name", brandProperties.getDisplayName()
+        ));
         body.put("public_key", stripeConfig.getStripePublicKey());
         body.put("platform_fee_percent", stripeConfig.getPlatformFeePercent());
         body.put("default_provider", PaymentProviderFactory.PROVIDER_STRIPE);
