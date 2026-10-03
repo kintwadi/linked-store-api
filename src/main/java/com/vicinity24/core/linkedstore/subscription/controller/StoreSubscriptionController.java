@@ -64,16 +64,35 @@ public class StoreSubscriptionController {
             active = subscriptionService.getCurrentStoreSubscription(storeId).orElse(null);
         }
         SubscriptionStatus storeStatus = store.getSubscriptionStatus();
-        boolean isSubscribed = active != null
-                && active.getCanceledAt() == null
-                && active.getEndedAt() == null
-                && (active.getStatus() == SubscriptionStatus.ACTIVE
-                    || active.getStatus() == SubscriptionStatus.TRIALING
-                    || active.getStatus() == SubscriptionStatus.PAST_DUE);
-        if (!isSubscribed && storeStatus != null) {
-            isSubscribed = storeStatus == SubscriptionStatus.ACTIVE
-                    || storeStatus == SubscriptionStatus.TRIALING
-                    || storeStatus == SubscriptionStatus.PAST_DUE;
+        final boolean rowPresent = active != null;
+        boolean isSubscribed;
+        if (rowPresent) {
+            // When the canonical subscription row EXISTS, trust it fully.
+            // canceledAt is intentionally EXCLUDED from the termination check:
+            // canceledAt = when the cancel-at-period-end REQUEST was made,
+            // NOT when the subscription actually ends. Actual termination is signaled
+            // via status ∈ {CANCELED, EXPIRED, SUSPENDED} or endedAt column set
+            // (both arrive via customer.subscription.updated / customer.subscription.deleted
+            // webhook, or via explicit immediate-cancel admin action).
+            boolean actualTerminated =
+                    active.getEndedAt() != null
+                            || active.getStatus() == SubscriptionStatus.CANCELED
+                            || active.getStatus() == SubscriptionStatus.EXPIRED
+                            || active.getStatus() == SubscriptionStatus.SUSPENDED
+                            || active.getStatus() == SubscriptionStatus.FREE;
+            boolean rowActive =
+                    active.getStatus() == SubscriptionStatus.ACTIVE
+                            || active.getStatus() == SubscriptionStatus.TRIALING
+                            || active.getStatus() == SubscriptionStatus.PAST_DUE;
+            // cancelAtPeriodEnd alone does NOT terminate isSubscribed.
+            // cancelAtPeriodEnd + endedAt/status=CANCELED does (caught by actualTerminated above).
+            isSubscribed = !actualTerminated && rowActive;
+        } else {
+            // Only FALL BACK to Store column when there is NO subscription row at all.
+            isSubscribed = storeStatus != null
+                    && (storeStatus == SubscriptionStatus.ACTIVE
+                        || storeStatus == SubscriptionStatus.TRIALING
+                        || storeStatus == SubscriptionStatus.PAST_DUE);
         }
         String fallbackStatus =
                 storeStatus != null

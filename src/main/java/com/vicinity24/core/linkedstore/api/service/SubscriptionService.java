@@ -2,7 +2,9 @@ package com.vicinity24.core.linkedstore.api.service;
 
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
+import com.stripe.param.SubscriptionListParams;
 import com.stripe.param.SubscriptionUpdateParams;
+import com.stripe.param.checkout.SessionListParams;
 import com.vicinity24.core.linkedstore.api.config.BrandProperties;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.entity.*;
@@ -159,6 +161,12 @@ public class SubscriptionService {
                 })
                 .orElseThrow(() -> new ResourceNotFoundException("Active Subscription for Store", storeId.toString()));
 
+        // Backfill providerSubscriptionId on rows that were auto-created locally without it
+        // (the canonical path where the webhook never delivered the provider ID).
+        // This ensures applyStripeCancelAtPeriodEnd below can actually reach Stripe and
+        // therefore the Stripe customer.subscription.updated webhook fires too.
+        current = resolveStripeProviderSubscriptionIdIfMissing(current, storeId);
+
         if (Boolean.TRUE.equals(current.getCancelAtPeriodEnd())) {
             return current;
         }
@@ -197,6 +205,117 @@ public class SubscriptionService {
 
     private static boolean isStripe(String provider) {
         return provider != null && PaymentProviderFactory.PROVIDER_STRIPE.equalsIgnoreCase(provider);
+    }
+
+    /**
+     * If a subscription row exists but {@code providerSubscriptionId} is missing
+     * (common when the row was created via our local fallback-builder and the webhook
+     * that would have delivered the provider ID failed previously), try to locate the
+     * real Stripe Subscription resource via metadata {@code storeId} or the
+     * {@code clientReferenceId = store:<UUID>} convention used at checkout-session time.
+     *
+     * <p>When found, the providerSubscriptionId is written BACK onto the local row
+     * (persisted) before returning so downstream flows (Stripe cancel, status syncs)
+     * never need this lookup again.</p>
+     *
+     * @return the same {@code subscription} instance, possibly with a populated
+     *         providerSubscriptionId (and the row saved if we updated it).
+     */
+    private Subscription resolveStripeProviderSubscriptionIdIfMissing(Subscription subscription, UUID storeId) {
+        if (subscription == null) return null;
+        if (!isStripe(subscription.getProvider())) return subscription;
+        if (subscription.getProviderSubscriptionId() != null && !subscription.getProviderSubscriptionId().isBlank()) {
+            return subscription;
+        }
+        String key = stripeConfig.getStripeApiKey();
+        if (key == null || key.isBlank()) {
+            log.warn("Stripe secret key missing, cannot backfill providerSubscriptionId for local sub={}", subscription.getId());
+            return subscription;
+        }
+        String prev = Stripe.apiKey;
+        try {
+            Stripe.apiKey = key;
+            final String storeIdStr = storeId.toString();
+            com.stripe.model.Subscription found = null;
+
+            // 1) Search by metadata[storeId]
+            try {
+                SubscriptionListParams byMeta = SubscriptionListParams.builder()
+                        .putAllMetadata(Map.of("storeId", storeIdStr))
+                        .setLimit(3L)
+                        .addAllExpand(List.of("data.customer"))
+                        .build();
+                var page = com.stripe.model.Subscription.list(byMeta);
+                if (page != null && page.getData() != null && !page.getData().isEmpty()) {
+                    found = page.getData().get(0);
+                }
+            } catch (StripeException e) {
+                log.warn("Failed listing Stripe subscriptions by metadata storeId={} err={}", storeIdStr, e.getMessage());
+            }
+
+            // 2) Fallback: search by clientReferenceId prefix "store:<UUID>" on the
+            //    checkout session that created this subscription.
+            if (found == null) {
+                try {
+                    String needle = "store:" + storeIdStr;
+                    SessionListParams params = SessionListParams.builder()
+                            .setLimit(20L)
+                            .setStatus(SessionListParams.Status.COMPLETE)
+                            .addAllExpand(List.of("data.subscription"))
+                            .build();
+                    var sessions = com.stripe.model.checkout.Session.list(params);
+                    if (sessions != null && sessions.getData() != null) {
+                        for (var s : sessions.getData()) {
+                            if (needle.equals(s.getClientReferenceId())
+                                    || (s.getMetadata() != null && storeIdStr.equals(s.getMetadata().get("storeId")))) {
+                                String psid = s.getSubscription();
+                                if (psid instanceof String sId && !sId.isBlank()) {
+                                    found = com.stripe.model.Subscription.retrieve(sId);
+                                    break;
+                                } else if (psid instanceof com.stripe.model.Subscription sub) {
+                                    found = sub;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (StripeException e) {
+                    log.warn("Failed locating Stripe checkout session by clientRef storeId={} err={}", storeIdStr, e.getMessage());
+                }
+            }
+
+            // 3) Last-resort fallback: newest 10 Stripe subscriptions and match metadata/storeId inside
+            if (found == null) {
+                try {
+                    SubscriptionListParams all = SubscriptionListParams.builder()
+                            .setLimit(10L)
+                            .addAllExpand(List.of("data.customer"))
+                            .build();
+                    var page = com.stripe.model.Subscription.list(all);
+                    if (page != null && page.getData() != null) {
+                        for (var cand : page.getData()) {
+                            var md = cand.getMetadata();
+                            if (md != null && storeIdStr.equals(md.get("storeId"))) {
+                                found = cand;
+                                break;
+                            }
+                        }
+                    }
+                } catch (StripeException e) {
+                    log.warn("Failed scanning recent Stripe subscriptions for storeId={} err={}", storeIdStr, e.getMessage());
+                }
+            }
+
+            if (found != null && found.getId() != null) {
+                subscription.setProviderSubscriptionId(found.getId());
+                subscription = subscriptionRepository.save(subscription);
+                log.info("Backfilled providerSubscriptionId on local sub={} store={} providerSub={}",
+                        subscription.getId(), storeIdStr, found.getId());
+            }
+        } finally {
+            Stripe.apiKey = prev;
+        }
+        return subscription;
     }
 
     private void applyStripeCancelAtPeriodEnd(Subscription subscription) {
