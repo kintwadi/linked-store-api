@@ -15,6 +15,7 @@ import java.util.UUID;
 public class CurrentUserResponse {
 
     private UUID id;
+    private UUID userId;
     private String email;
     private String name;
     private String phoneNumber;

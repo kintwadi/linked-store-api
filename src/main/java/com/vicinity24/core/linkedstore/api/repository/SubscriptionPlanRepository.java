@@ -24,4 +24,12 @@ public interface SubscriptionPlanRepository extends JpaRepository<SubscriptionPl
             ORDER BY p.priceCents ASC
             """)
     List<SubscriptionPlan> findCorePublicPlans();
+
+    @Query("""
+            SELECT p FROM SubscriptionPlan p
+            LEFT JOIN FETCH p.features
+            WHERE p.planCode IN :codes
+            ORDER BY COALESCE(p.sortOrder, 0) ASC, p.planCode ASC
+            """)
+    List<SubscriptionPlan> findAllWithFeaturesByPlanCodeIn(@org.springframework.data.repository.query.Param("codes") List<String> codes);
 }

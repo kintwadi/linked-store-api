@@ -1,4 +1,4 @@
-spring:
+﻿spring:
   application:
     name: Linked Store
 
@@ -39,6 +39,29 @@ spring:
     serialization:
       write-dates-as-timestamps: false
     property-naming-strategy: SNAKE_CASE
+
+  mail:
+    host: ${MAIL_HOST:localhost}
+    port: ${MAIL_PORT:25}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    default-encoding: UTF-8
+    from: ${MAIL_FROM:${MAIL_USERNAME:noreply@vicinity24.com}}
+    properties:
+      mail:
+        transport:
+          protocol: smtps
+        smtp:
+          auth: true
+          starttls:
+            enable: ${MAIL_SMTP_STARTTLS_ENABLE:false}
+            required: false
+          ssl:
+            enable: ${MAIL_SMTP_SSL_ENABLE:false}
+            trust: ${MAIL_SMTP_SSL_TRUST:}
+          connectiontimeout: 15000
+          timeout: 15000
+          writetimeout: 15000
 
   scheduling:
     pool:
@@ -99,9 +122,14 @@ server:
 seed:
   catalog: false
 
+platform:
+  root:
+    admin: ${LINKEDSTORE_PLATFORM_ROOT_ADMIN}
+
 linkedstore:
   brand:
     display-name: ${LINKEDSTORE_BRAND_DISPLAY_NAME:Linked-Store}
+    contact-sales-to: ${MAIL_CONTACT_SALES_TO:info@vicinity24.com}
   auth:
     jwt-secret: ${LINKEDSTORE_AUTH_JWT_SECRET:linked-store-dev-super-secret-key-please-change-in-production-64chars-Minimum!!OK}
     access-token-minutes: ${LINKEDSTORE_AUTH_ACCESS_TOKEN_MINUTES:30}
@@ -116,3 +144,7 @@ linkedstore:
       base-url: ${LOCATION_IQ_BASE_URL:https://us1.locationiq.com}
       countrycodes: ${LOCATION_IQ_COUNTRYCODES:pt,de,fr,be}
       timeout-ms: ${LOCATION_IQ_TIMEOUT_MS:8000}
+  products:
+    upload:
+      frontend-source: ${LINKEDSTORE_PRODUCTS_UPLOAD_FRONTEND_SOURCE:}
+      public-base-url: ${LINKEDSTORE_PRODUCTS_UPLOAD_PUBLIC_BASE_URL:}

@@ -238,12 +238,13 @@ public class SubscriptionService {
             final String storeIdStr = storeId.toString();
             com.stripe.model.Subscription found = null;
 
-            // 1) Search by metadata[storeId]
+            // 1) Search by metadata[storeId] query param (Stripe list filter convention
+            //    is: extraParams map with key "metadata[storeId]" = value).
             try {
                 SubscriptionListParams byMeta = SubscriptionListParams.builder()
-                        .putAllMetadata(Map.of("storeId", storeIdStr))
+                        .putExtraParam("metadata[storeId]", storeIdStr)
                         .setLimit(3L)
-                        .addAllExpand(List.of("data.customer"))
+                        .addExpand("data.customer")
                         .build();
                 var page = com.stripe.model.Subscription.list(byMeta);
                 if (page != null && page.getData() != null && !page.getData().isEmpty()) {
@@ -269,11 +270,8 @@ public class SubscriptionService {
                             if (needle.equals(s.getClientReferenceId())
                                     || (s.getMetadata() != null && storeIdStr.equals(s.getMetadata().get("storeId")))) {
                                 String psid = s.getSubscription();
-                                if (psid instanceof String sId && !sId.isBlank()) {
-                                    found = com.stripe.model.Subscription.retrieve(sId);
-                                    break;
-                                } else if (psid instanceof com.stripe.model.Subscription sub) {
-                                    found = sub;
+                                if (psid != null && !psid.isBlank()) {
+                                    found = com.stripe.model.Subscription.retrieve(psid);
                                     break;
                                 }
                             }
@@ -289,7 +287,7 @@ public class SubscriptionService {
                 try {
                     SubscriptionListParams all = SubscriptionListParams.builder()
                             .setLimit(10L)
-                            .addAllExpand(List.of("data.customer"))
+                            .addExpand("data.customer")
                             .build();
                     var page = com.stripe.model.Subscription.list(all);
                     if (page != null && page.getData() != null) {

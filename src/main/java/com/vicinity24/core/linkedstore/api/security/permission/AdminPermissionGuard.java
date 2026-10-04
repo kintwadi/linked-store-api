@@ -99,6 +99,10 @@ class AdminPermissionGuard {
         return hasDbStoreRole(caller, storeId, StoreUserRole.OWNER, StoreUserRole.STORE_ADMIN);
     }
 
+    boolean canEditSubscriptionPlans(CurrentUser caller) {
+        return isGlobalAdmin(caller);
+    }
+
     // ---------- helpers ----------
 
     private static boolean matchesJwtStoreAndRole(CurrentUser caller, UUID target, UserRole... allowed) {

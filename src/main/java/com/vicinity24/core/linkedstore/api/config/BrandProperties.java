@@ -10,4 +10,5 @@ import org.springframework.context.annotation.Configuration;
 public class BrandProperties {
 
     private String displayName = "Linked-Store";
+    private String contactSalesTo = "info@vicinity24.com";
 }

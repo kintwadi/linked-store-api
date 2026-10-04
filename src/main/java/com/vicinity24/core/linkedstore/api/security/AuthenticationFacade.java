@@ -67,6 +67,10 @@ public class AuthenticationFacade {
         permissionService.ensureCanManageSubscription(current(), targetStoreId);
     }
 
+    public void requireCanEditSubscriptionPlans() {
+        permissionService.ensureCanEditSubscriptionPlans(current());
+    }
+
     private static CurrentUser anonymous() {
         return CurrentUser.builder()
                 .authenticated(false)

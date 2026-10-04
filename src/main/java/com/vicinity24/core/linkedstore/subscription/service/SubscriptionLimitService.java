@@ -3,6 +3,7 @@ package com.vicinity24.core.linkedstore.subscription.service;
 import com.vicinity24.core.linkedstore.api.entity.Subscription;
 import com.vicinity24.core.linkedstore.api.entity.SubscriptionPlan;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
+import com.vicinity24.core.linkedstore.api.repository.SubscriptionPlanRepository;
 import com.vicinity24.core.linkedstore.api.repository.SubscriptionRepository;
 import com.vicinity24.core.linkedstore.subscription.PlanTier;
 import com.vicinity24.core.linkedstore.subscription.SubscriptionTierSettings;
@@ -28,16 +29,8 @@ public class SubscriptionLimitService {
     private final SubscriptionTierSettings tierSettings;
     private final EntityManager entityManager;
     private final SubscriptionRepository subscriptionRepository;
+    private final SubscriptionPlanRepository planRepository;
 
-    /**
-     * Counts processed orders for a store in the current calendar month.
-     *
-     * We include BOTH sides of a transaction — originatingStoreId (the broker store
-     * that listed/resold the product) AND fulfillingStoreId (the store that actually
-     * owns and fulfills the inventory) — because each involvement represents a
-     * processed order that consumes quota: a broker pays for the right to resell into
-     * the network, and a fulfiller pays for the right to receive demand from it.
-     */
     public long countCurrentMonthOrders(UUID storeId) {
         OffsetDateTime startOfMonth = OffsetDateTime.now()
                 .withDayOfMonth(1)
@@ -65,26 +58,21 @@ public class SubscriptionLimitService {
     }
 
     public void checkOrderLimit(UUID storeId) {
-        PlanTier tier = determineEffectiveTier(storeId);
+        SubscriptionPlan plan = resolveEffectivePlan(storeId);
+        PlanTier tier = planToTier(plan);
+        Integer limit = resolveMonthlyOrderLimit(plan, tier);
 
-        if (tier == PlanTier.CUSTOM) {
-            log.info("enterprise tier: no order cap for store {}", storeId);
+        if (limit == null || limit < 0) {
+            log.info("{} tier: no monthly order cap for store {}", tier, storeId);
             return;
         }
-
-        Integer limitSetting = tierSettings.getPro().getMonthlyOrderLimit();
-        if (limitSetting == null || limitSetting < 0) {
-            log.info("PRO tier: no monthly order cap configured for store {}", storeId);
-            return;
-        }
-        int limit = limitSetting;
 
         long currentLong = countCurrentMonthOrders(storeId);
         int current = (int) Math.min(currentLong, Integer.MAX_VALUE);
 
         if (Long.compare(currentLong, (long) limit) >= 0) {
-            log.warn("order limit exceeded storeId={} currentCount={} limit={} tier=PRO",
-                    storeId, current, limit);
+            log.warn("order limit exceeded storeId={} currentCount={} limit={} tier={}",
+                    storeId, current, limit, tier);
             throw new OrderLimitExceededException(storeId, current, limit);
         }
 
@@ -93,14 +81,15 @@ public class SubscriptionLimitService {
     }
 
     public Map<String, Object> getPlanInfo(UUID storeId) {
-        PlanTier tier = determineEffectiveTier(storeId);
+        SubscriptionPlan plan = resolveEffectivePlan(storeId);
+        PlanTier tier = planToTier(plan);
         long currentCount = countCurrentMonthOrders(storeId);
-        Integer limit = tier == PlanTier.PRO ? tierSettings.getPro().getMonthlyOrderLimit() : null;
+        Integer limit = normalizeUnlimited(resolveMonthlyOrderLimit(plan, tier));
 
         Map<String, Object> info = new HashMap<>();
         info.put("tier", tier.name());
         info.put("planCode", tier.getPlanCode());
-        info.put("displayName", tier.getDisplayName());
+        info.put("displayName", plan != null && plan.getDisplayName() != null ? plan.getDisplayName() : tier.getDisplayName());
         info.put("isEnterprise", tier.isEnterprise());
         info.put("monthlyOrderLimit", limit);
         info.put("currentMonthOrders", currentCount);
@@ -108,20 +97,44 @@ public class SubscriptionLimitService {
         return info;
     }
 
-    private PlanTier determineEffectiveTier(UUID storeId) {
+    private static Integer normalizeUnlimited(Integer v) {
+        if (v == null) return null;
+        if (v < 0 || v.equals(Integer.MAX_VALUE)) return null;
+        return v;
+    }
+
+    private SubscriptionPlan resolveEffectivePlan(UUID storeId) {
         List<Subscription> activeSubs = subscriptionRepository.findActiveOrGraceByStoreId(storeId);
         for (Subscription sub : activeSubs) {
             SubscriptionPlan plan = sub.getPlan();
             if (plan != null && plan.getPlanCode() != null) {
-                String code = plan.getPlanCode().toUpperCase();
-                if (code.contains("CUSTOM")) {
-                    return PlanTier.CUSTOM;
-                }
-                if (code.contains("PRO")) {
-                    return PlanTier.PRO;
-                }
+                return plan;
             }
         }
+        try {
+            return planRepository.findByPlanCode("PRO").orElse(null);
+        } catch (RuntimeException ignore) {
+            return null;
+        }
+    }
+
+    private PlanTier planToTier(SubscriptionPlan plan) {
+        if (plan == null || plan.getPlanCode() == null) return PlanTier.PRO;
+        String code = plan.getPlanCode().toUpperCase();
+        if (code.contains("CUSTOM")) return PlanTier.CUSTOM;
         return PlanTier.PRO;
+    }
+
+    private Integer resolveMonthlyOrderLimit(SubscriptionPlan plan, PlanTier tier) {
+        if (tier == PlanTier.CUSTOM) {
+            if (plan != null && plan.getMonthlyOrderLimit() != null) {
+                return plan.getMonthlyOrderLimit();
+            }
+            return null;
+        }
+        if (plan != null && plan.getMonthlyOrderLimit() != null) {
+            return plan.getMonthlyOrderLimit();
+        }
+        return tierSettings.getPro().getMonthlyOrderLimit();
     }
 }

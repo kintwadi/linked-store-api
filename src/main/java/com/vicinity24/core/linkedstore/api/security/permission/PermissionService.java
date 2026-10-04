@@ -191,4 +191,14 @@ public class PermissionService {
             throw new PermissionDeniedException("manage-subscription", storeId, "SUBSCRIPTION_MANAGE_UNAUTHORIZED");
         }
     }
+
+    public boolean canEditSubscriptionPlans(CurrentUser caller) {
+        return adminGuard.canEditSubscriptionPlans(caller);
+    }
+
+    public void ensureCanEditSubscriptionPlans(CurrentUser caller) {
+        if (!canEditSubscriptionPlans(caller)) {
+            throw new PermissionDeniedException("edit-subscription-plans", null, "GLOBAL_ADMIN_REQUIRED");
+        }
+    }
 }

@@ -1,5 +1,6 @@
 package com.vicinity24.core.linkedstore.api.entity;
 
+import com.vicinity24.core.linkedstore.api.converter.StringArrayCsvConverter;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -7,6 +8,8 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 @Data
@@ -32,19 +35,19 @@ public class SubscriptionPlan {
     @Column(name = "description", length = 1024)
     private String description;
 
-    @Column(name = "price_cents", nullable = false)
+    @Column(name = "price_cents")
     private Integer priceCents;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "interval_unit", nullable = false, length = 20)
+    @Column(name = "interval_unit", length = 20)
     @Builder.Default
     private SubscriptionInterval intervalUnit = SubscriptionInterval.MONTH;
 
-    @Column(name = "interval_count", nullable = false)
+    @Column(name = "interval_count")
     @Builder.Default
     private Integer intervalCount = 1;
 
-    @Column(name = "currency", nullable = false, length = 10)
+    @Column(name = "currency", length = 10)
     @Builder.Default
     private String currency = "usd";
 
@@ -68,6 +71,46 @@ public class SubscriptionPlan {
     @Column(name = "max_products")
     private Integer maxProducts;
 
+    @Column(name = "annual_price_cents")
+    private Integer annualPriceCents;
+
+    @Column(name = "annual_discount_percent")
+    private Integer annualDiscountPercent;
+
+    @Column(name = "billing_label_monthly", length = 120)
+    private String billingLabelMonthly;
+
+    @Column(name = "billing_label_annual", length = 160)
+    private String billingLabelAnnual;
+
+    @Column(name = "max_connected_stores")
+    private Integer maxConnectedStores;
+
+    @Column(name = "monthly_order_limit")
+    private Integer monthlyOrderLimit;
+
+    @Convert(converter = StringArrayCsvConverter.class)
+    @Column(name = "badges", length = 1024)
+    private String[] badges;
+
+    @Column(name = "is_contact_sales_enabled")
+    @Builder.Default
+    private Boolean contactSalesEnabled = false;
+
+    @Column(name = "contact_sales_email", length = 254)
+    private String contactSalesEmail;
+
+    @Column(name = "contact_sales_url", length = 512)
+    private String contactSalesUrl;
+
+    @Column(name = "sort_order")
+    @Builder.Default
+    private Integer sortOrder = 0;
+
+    @OneToMany(mappedBy = "plan", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default
+    private List<SubscriptionPlanFeature> features = new ArrayList<>();
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
 
@@ -81,8 +124,11 @@ public class SubscriptionPlan {
         updatedAt = now;
         if (isActive == null) isActive = true;
         if (intervalCount == null) intervalCount = 1;
-        if (currency == null) currency = "usd";
+        if (currency == null && priceCents != null) currency = "usd";
         if (trialDays == null) trialDays = 0;
+        if (contactSalesEnabled == null) contactSalesEnabled = false;
+        if (sortOrder == null) sortOrder = 0;
+        if (features == null) features = new ArrayList<>();
     }
 
     @PreUpdate

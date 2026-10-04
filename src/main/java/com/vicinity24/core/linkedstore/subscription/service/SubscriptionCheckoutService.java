@@ -8,8 +8,10 @@ import com.vicinity24.core.linkedstore.api.config.BrandProperties;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.Subscription;
+import com.vicinity24.core.linkedstore.api.entity.SubscriptionPlan;
 import com.vicinity24.core.linkedstore.api.entity.SubscriptionStatus;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
+import com.vicinity24.core.linkedstore.api.repository.SubscriptionPlanRepository;
 import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
 import com.vicinity24.core.linkedstore.subscription.PlanTier;
 import com.vicinity24.core.linkedstore.subscription.SubscriptionTierSettings;
@@ -35,6 +37,7 @@ public class SubscriptionCheckoutService {
     private final StripeConfig stripeConfig;
     private final BrandProperties brandProperties;
     private final AuthenticationFacade authenticationFacade;
+    private final SubscriptionPlanRepository planRepository;
 
     @Transactional
     public SubscriptionCheckoutResponse createCheckout(@Valid SubscriptionCheckoutRequest request) {
@@ -48,9 +51,6 @@ public class SubscriptionCheckoutService {
         String requestedPlanCode = tier.getPlanCode();
         String interval = normalizeInterval(request.getInterval());
 
-        // Idempotency: if the store is already subscribed to the requested plan
-        // (active, trialing, or even past-due but not yet canceled/expired),
-        // do NOT create a duplicate Stripe subscription or checkout session.
         Subscription existing = store.getActiveSubscription();
         SubscriptionStatus storeStatus = store.getSubscriptionStatus();
         boolean storeColActive = storeStatus == SubscriptionStatus.ACTIVE
@@ -75,7 +75,6 @@ public class SubscriptionCheckoutService {
                         .build();
             }
         } else if (storeColActive) {
-            // Fallback via Store.subscription_status column (subscription row may be missing)
             return SubscriptionCheckoutResponse.builder()
                     .type("ERROR")
                     .storeId(storeId.toString())
@@ -92,41 +91,53 @@ public class SubscriptionCheckoutService {
                         && authenticationFacade.current().isGlobalAdmin();
 
         if (tier == PlanTier.CUSTOM) {
+            SubscriptionPlan plan = null;
+            try { plan = planRepository.findByPlanCode("CUSTOM").orElse(null); } catch (RuntimeException ignore) {}
+            String csEmail = plan != null && plan.getContactSalesEmail() != null && !plan.getContactSalesEmail().isBlank()
+                    ? plan.getContactSalesEmail()
+                    : (tierSettings.getCustom().getContactSalesEmail() == null
+                    ? "sales@vicinity24.dev"
+                    : tierSettings.getCustom().getContactSalesEmail());
             return SubscriptionCheckoutResponse.builder()
                     .type("CONTACT_SALES")
                     .storeId(storeId.toString())
                     .planCode(tier.getPlanCode())
                     .interval(interval)
                     .message("Custom Enterprise plan requires a dedicated sales onboarding.")
-                    .contactSalesEmail(tierSettings.getCustom().getContactSalesEmail() == null
-                            ? "sales@vicinity24.dev"
-                            : tierSettings.getCustom().getContactSalesEmail())
+                    .contactSalesEmail(csEmail)
                     .pricingPageUrl("/pricing")
                     .build();
         }
 
         ensureStripeKey();
 
+        SubscriptionPlan plan = null;
+        try { plan = planRepository.findByPlanCode("PRO").orElse(null); } catch (RuntimeException ignore) {}
         SubscriptionTierSettings.TierProSettings pro = tierSettings.getPro();
         long unitAmountCents;
         String sessionInterval;
         int intervalCount;
+        Integer monthlyLimit;
         if ("yearly".equalsIgnoreCase(interval) || "annual".equalsIgnoreCase(interval) || "year".equalsIgnoreCase(interval)) {
-            unitAmountCents = (long) pro.getAnnualPriceCents();
+            int annualCents = plan != null && plan.getAnnualPriceCents() != null ? plan.getAnnualPriceCents() : pro.getAnnualPriceCents();
+            unitAmountCents = (long) annualCents;
             sessionInterval = "year";
             intervalCount = 1;
         } else {
-            unitAmountCents = (long) pro.getMonthlyPriceCents();
+            int monthlyCents = plan != null && plan.getPriceCents() != null ? plan.getPriceCents() : pro.getMonthlyPriceCents();
+            unitAmountCents = (long) monthlyCents;
             sessionInterval = "month";
             intervalCount = 1;
         }
-
-        String currency = (pro.getCurrency() != null && !pro.getCurrency().isBlank()) ? pro.getCurrency() : "usd";
-        int trialDays = pro.getTrialDays();
+        String currency = (plan != null && plan.getCurrency() != null && !plan.getCurrency().isBlank())
+                ? plan.getCurrency()
+                : ((pro.getCurrency() != null && !pro.getCurrency().isBlank()) ? pro.getCurrency() : "usd");
+        int trialDays = plan != null && plan.getTrialDays() != null ? plan.getTrialDays() : pro.getTrialDays();
+        monthlyLimit = plan != null && plan.getMonthlyOrderLimit() != null ? plan.getMonthlyOrderLimit() : pro.getMonthlyOrderLimit();
 
         String productName = brandProperties.getDisplayName() + " — " + tier.getDisplayName() + " Plan";
         String productDescription = tier == PlanTier.PRO
-                ? "Unlimited stores, up to " + pro.getMonthlyOrderLimit() + " orders/mo, API & webhooks, email support."
+                ? "Unlimited stores, up to " + monthlyLimit + " orders/mo, API & webhooks, email support."
                 : "Platform subscription.";
 
         String successFallback = isGlobalAdmin

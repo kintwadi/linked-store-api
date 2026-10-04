@@ -22,6 +22,8 @@ public interface ProductVariantRepository extends JpaRepository<ProductVariant, 
 
     Optional<ProductVariant> findBySku(String sku);
 
+    Optional<ProductVariant> findByStoreIdAndSku(UUID storeId, String sku);
+
     List<ProductVariant> findByProductId(UUID productId);
 
     List<ProductVariant> findByStoreIdAndStatus(UUID storeId, VariantStatus status);
