@@ -1,0 +1,53 @@
+# ====================================================================
+#  BACKEND .dockerignore  – keep the Docker build context small
+# ====================================================================
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+*.ipr
+*.iws
+
+# --- Git / CI metadata ---
+.git/
+.gitignore
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+.husky/
+
+# --- Render files (if any) ---
+render.yaml
+render.yml
+
+# --- Maven build output / caches ---
+target/
+build/
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/
+mvnw
+mvnw.cmd
+
+# --- Local config / env overrides (never bake these into images) ---
+.env
+.env.*
+application-local.yml
+application-docker.yml
+application-override.yml
+*.override.yml
+
+# --- Uploaded product images, logs, h2 local files ---
+src/main/resources/static/products/uploaded/
+*.log
+*.h2.db
+hsqldb/
+data/

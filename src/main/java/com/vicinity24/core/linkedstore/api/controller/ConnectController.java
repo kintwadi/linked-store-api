@@ -19,9 +19,14 @@ import com.vicinity24.core.linkedstore.api.dto.LinkAttempt;
 import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
 import com.vicinity24.core.linkedstore.api.dto.StripeErrorInfo;
 import com.vicinity24.core.linkedstore.api.entity.Store;
+import com.vicinity24.core.linkedstore.api.entity.Subscription;
+import com.vicinity24.core.linkedstore.api.entity.SubscriptionPlan;
+import com.vicinity24.core.linkedstore.api.entity.SubscriptionStatus;
 import com.vicinity24.core.linkedstore.api.entity.Transaction;
 import com.vicinity24.core.linkedstore.api.entity.TransactionStatus;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
+import com.vicinity24.core.linkedstore.api.repository.SubscriptionPlanRepository;
+import com.vicinity24.core.linkedstore.api.repository.SubscriptionRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.service.CheckoutService;
 import jakarta.validation.Valid;
@@ -34,6 +39,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.OffsetDateTime;
 import java.util.*;
 
 @Slf4j
@@ -45,6 +51,8 @@ public class ConnectController {
     private final StripeConfig stripeConfig;
     private final StoreRepository storeRepository;
     private final TransactionRepository transactionRepository;
+    private final SubscriptionRepository subscriptionRepository;
+    private final SubscriptionPlanRepository subscriptionPlanRepository;
     private final CheckoutService checkoutService;
 
     @Value("${stripe.webhook-secret:}")
@@ -356,6 +364,20 @@ public class ConnectController {
             case "checkout.session.async_payment_succeeded":
                 handleCheckoutSessionCompleted(event);
                 break;
+            case "customer.subscription.created":
+            case "customer.subscription.updated":
+            case "customer.subscription.trial_will_end":
+            case "customer.subscription.paused":
+            case "customer.subscription.resumed":
+            case "customer.subscription.deleted":
+                handleCustomerSubscriptionEvent(event);
+                break;
+            case "invoice.paid":
+                handleInvoicePaidEvent(event);
+                break;
+            case "invoice.payment_failed":
+                handleInvoicePaymentFailedEvent(event);
+                break;
             default:
                 log.info("Connect: ignoring unhandled webhook event {}", type);
                 break;
@@ -406,6 +428,61 @@ public class ConnectController {
             final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
             if (!(dataObject instanceof Session session)) return;
             final Map<String, String> metadata = session.getMetadata();
+
+            final String mode = session.getMode();
+            if (mode != null && "subscription".equalsIgnoreCase(mode)) {
+                final String storeIdRaw = metadata != null
+                        ? (metadata.get("storeId") != null ? metadata.get("storeId") : parseStoreIdFromClientRef(session.getClientReferenceId()))
+                        : parseStoreIdFromClientRef(session.getClientReferenceId());
+                if (storeIdRaw == null) {
+                    log.warn("Connect: checkout.session.completed SUBSCRIPTION missing storeId metadata: session={}", session.getId());
+                    return;
+                }
+                final UUID storeId;
+                try { storeId = UUID.fromString(storeIdRaw); }
+                catch (IllegalArgumentException iae) { log.warn("Connect: invalid storeId {}", storeIdRaw); return; }
+                final String planCodeRaw = (metadata != null)
+                        ? (metadata.get("planCode") != null ? metadata.get("planCode") : metadata.get("tier"))
+                        : null;
+                final String intervalRaw = (metadata != null) ? metadata.get("interval") : null;
+                final String providerSubscriptionId = session.getSubscription();
+                final String providerCustomerId = session.getCustomer();
+
+                final Optional<Store> storeOpt = storeRepository.findById(storeId);
+                if (storeOpt.isEmpty()) {
+                    log.warn("Connect: checkout.session.completed store not found: storeId={} session={}", storeId, session.getId());
+                    return;
+                }
+                final Store store = storeOpt.get();
+                final SubscriptionPlan plan = resolvePlanOrDefault(planCodeRaw);
+                final SubscriptionStatus initialStatus = session.getSubscription() != null
+                        ? SubscriptionStatus.ACTIVE
+                        : SubscriptionStatus.TRIALING;
+                final Subscription sub = subscriptionRepository
+                        .findFirstByStoreIdOrderByCreatedAtDesc(storeId)
+                        .filter(s -> s.getProviderSubscriptionId() != null
+                                && s.getProviderSubscriptionId().equals(providerSubscriptionId))
+                        .orElseGet(() -> Subscription.builder()
+                                .storeId(storeId)
+                                .plan(plan)
+                                .status(initialStatus)
+                                .provider("STRIPE")
+                                .providerSubscriptionId(providerSubscriptionId)
+                                .providerCustomerId(providerCustomerId)
+                                .cancelAtPeriodEnd(false)
+                                .build());
+                if (sub.getId() == null) subscriptionRepository.save(sub);
+                else subscriptionRepository.saveAndFlush(sub);
+
+                store.setSubscriptionStatus(sub.getStatus());
+                store.setActiveSubscription(sub);
+                storeRepository.save(store);
+
+                log.info("Connect: checkout.session.completed SUBSCRIPTION stored store={} sub={} providerSub={} plan={} interval={}",
+                        storeId, sub.getId(), providerSubscriptionId, plan != null ? plan.getPlanCode() : null, intervalRaw);
+                return;
+            }
+
             final String txIdRaw = metadata != null ? metadata.get("transactionId") : null;
             if (txIdRaw == null) {
                 log.warn("Connect: checkout.session.completed missing transactionId metadata: session={}", session.getId());
@@ -423,6 +500,194 @@ public class ConnectController {
             log.info("Connect: checkout.session.completed finalized tx={} pi={} explicitPayouts={}", txId, piId, explicitPayouts);
         } catch (Exception ex) {
             log.error("Connect: handleCheckoutSessionCompleted failed for event {}", event.getId(), ex);
+        }
+    }
+
+    private void handleCustomerSubscriptionEvent(Event event) {
+        try {
+            final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
+            if (!(dataObject instanceof com.stripe.model.Subscription stripeSub)) return;
+            final Map<String, String> md = stripeSub.getMetadata();
+            final String storeIdRaw = md != null
+                    ? (md.get("storeId") != null ? md.get("storeId") : parseStoreIdFromClientRef(md.get("clientReferenceId")))
+                    : null;
+            if (storeIdRaw == null) {
+                log.warn("Connect: subscription event {} missing storeId metadata on providerSub={}", event.getType(), stripeSub.getId());
+                return;
+            }
+            final UUID storeId;
+            try { storeId = UUID.fromString(storeIdRaw); }
+            catch (IllegalArgumentException iae) {
+                log.warn("Connect: subscription event invalid storeId={}", storeIdRaw);
+                return;
+            }
+            final Optional<Store> storeOpt = storeRepository.findById(storeId);
+            if (storeOpt.isEmpty()) return;
+            final Store store = storeOpt.get();
+            final String planCodeRaw = md != null ? md.get("planCode") : null;
+            final SubscriptionPlan plan = resolvePlanOrDefault(planCodeRaw);
+            final SubscriptionStatus status = mapStripeSubscriptionStatus(stripeSub.getStatus(), stripeSub.getCancelAtPeriodEnd(), stripeSub.getCancelAt() != null || "canceled".equalsIgnoreCase(stripeSub.getStatus()));
+            final Subscription sub = subscriptionRepository
+                    .findFirstByStoreIdOrderByCreatedAtDesc(storeId)
+                    .filter(s -> s.getProviderSubscriptionId() == null || s.getProviderSubscriptionId().equals(stripeSub.getId()))
+                    .orElseGet(() -> Subscription.builder()
+                            .storeId(storeId)
+                            .plan(plan)
+                            .status(status)
+                            .provider("STRIPE")
+                            .providerSubscriptionId(stripeSub.getId())
+                            .providerCustomerId(stripeSub.getCustomer())
+                            .cancelAtPeriodEnd(Boolean.TRUE.equals(stripeSub.getCancelAtPeriodEnd()))
+                            .build());
+            sub.setStatus(status);
+            sub.setProviderSubscriptionId(stripeSub.getId());
+            sub.setProviderCustomerId(stripeSub.getCustomer());
+            sub.setCancelAtPeriodEnd(Boolean.TRUE.equals(stripeSub.getCancelAtPeriodEnd()));
+            sub.setCurrentPeriodStart(toOffsetDateTimeOrNull(stripeSub.getCurrentPeriodStart()));
+            sub.setCurrentPeriodEnd(toOffsetDateTimeOrNull(stripeSub.getCurrentPeriodEnd()));
+            sub.setTrialStart(toOffsetDateTimeOrNull(stripeSub.getTrialStart()));
+            sub.setTrialEnd(toOffsetDateTimeOrNull(stripeSub.getTrialEnd()));
+            if (Boolean.TRUE.equals(stripeSub.getCancelAtPeriodEnd()) && sub.getCanceledAt() == null) {
+                sub.setCanceledAt(OffsetDateTime.now());
+            }
+            if ("canceled".equalsIgnoreCase(stripeSub.getStatus()) && sub.getEndedAt() == null) {
+                sub.setEndedAt(OffsetDateTime.now());
+            }
+            subscriptionRepository.save(sub);
+            store.setSubscriptionStatus(status);
+            store.setActiveSubscription(sub);
+            storeRepository.save(store);
+            log.info("Connect: subscription event {} for store={} sub={} status={}", event.getType(), storeId, sub.getId(), status);
+        } catch (Exception ex) {
+            log.error("Connect: handleCustomerSubscriptionEvent failed for event {} type={}", event.getId(), event.getType(), ex);
+        }
+    }
+
+    private void handleInvoicePaidEvent(Event event) {
+        try {
+            final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
+            if (!(dataObject instanceof com.stripe.model.Invoice invoice)) return;
+            final String providerSubId = invoice.getSubscription();
+            if (providerSubId == null) return;
+            final Subscription existing = subscriptionRepository
+                    .findByProviderSubscriptionId(providerSubId)
+                    .orElseGet(() -> {
+                        String storeIdRaw = null;
+                        try {
+                            if (invoice.getLines() != null
+                                    && invoice.getLines().getData() != null
+                                    && !invoice.getLines().getData().isEmpty()
+                                    && invoice.getLines().getData().get(0) != null) {
+                                com.stripe.model.InvoiceLineItem line = invoice.getLines().getData().get(0);
+                                if (line.getMetadata() != null && line.getMetadata().get("storeId") != null) {
+                                    storeIdRaw = line.getMetadata().get("storeId");
+                                }
+                            }
+                        } catch (Exception ignore) { storeIdRaw = null; }
+                        if (storeIdRaw == null && invoice.getSubscriptionDetails() != null && invoice.getSubscriptionDetails().getMetadata() != null) {
+                            storeIdRaw = invoice.getSubscriptionDetails().getMetadata().get("storeId");
+                        }
+                        if (storeIdRaw == null) {
+                            try {
+                                com.stripe.model.Subscription sub = com.stripe.model.Subscription.retrieve(providerSubId);
+                                if (sub != null && sub.getMetadata() != null && sub.getMetadata().get("storeId") != null) {
+                                    storeIdRaw = sub.getMetadata().get("storeId");
+                                }
+                            } catch (StripeException ignore) { storeIdRaw = null; }
+                        }
+                        if (storeIdRaw == null) return null;
+                        final UUID storeId;
+                        try { storeId = UUID.fromString(storeIdRaw); } catch (IllegalArgumentException iae) { return null; }
+                        return Subscription.builder()
+                                .storeId(storeId)
+                                .provider("STRIPE")
+                                .providerSubscriptionId(providerSubId)
+                                .build();
+                    });
+            if (existing == null) {
+                log.debug("Connect: invoice.paid missing storeId providerSub={} invoice={}", providerSubId, invoice.getId());
+                return;
+            }
+            existing.setCurrentPeriodStart(toOffsetDateTimeOrNull(invoice.getPeriodStart()));
+            existing.setCurrentPeriodEnd(toOffsetDateTimeOrNull(invoice.getPeriodEnd()));
+            if (existing.getStatus() != SubscriptionStatus.ACTIVE && existing.getStatus() != SubscriptionStatus.CANCELED && existing.getStatus() != SubscriptionStatus.EXPIRED) {
+                existing.setStatus(SubscriptionStatus.ACTIVE);
+            }
+            subscriptionRepository.save(existing);
+            storeRepository.findById(existing.getStoreId()).ifPresent(store -> {
+                store.setSubscriptionStatus(existing.getStatus());
+                store.setActiveSubscription(existing);
+                storeRepository.save(store);
+            });
+        } catch (Exception ex) {
+            log.error("Connect: handleInvoicePaidEvent failed event={}", event.getId(), ex);
+        }
+    }
+
+    private void handleInvoicePaymentFailedEvent(Event event) {
+        try {
+            final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
+            if (!(dataObject instanceof com.stripe.model.Invoice invoice)) return;
+            final String providerSubId = invoice.getSubscription();
+            if (providerSubId == null) return;
+            subscriptionRepository.findByProviderSubscriptionId(providerSubId).ifPresent(sub -> {
+                if (sub.getStatus() != SubscriptionStatus.CANCELED && sub.getStatus() != SubscriptionStatus.EXPIRED) {
+                    sub.setStatus(SubscriptionStatus.PAST_DUE);
+                    subscriptionRepository.save(sub);
+                    storeRepository.findById(sub.getStoreId()).ifPresent(store -> {
+                        store.setSubscriptionStatus(sub.getStatus());
+                        store.setActiveSubscription(sub);
+                        storeRepository.save(store);
+                    });
+                }
+            });
+        } catch (Exception ex) {
+            log.error("Connect: handleInvoicePaymentFailedEvent failed event={}", event.getId(), ex);
+        }
+    }
+
+    private SubscriptionPlan resolvePlanOrDefault(String planCodeRaw) {
+        if (planCodeRaw != null) {
+            final String pc = planCodeRaw.trim().toUpperCase();
+            final Optional<SubscriptionPlan> opt = subscriptionPlanRepository.findByPlanCode(pc);
+            if (opt.isPresent()) return opt.get();
+        }
+        return subscriptionPlanRepository.findByPlanCode("PRO")
+                .orElseGet(() -> subscriptionPlanRepository.findAll().stream().findFirst().orElse(null));
+    }
+
+    private static String parseStoreIdFromClientRef(String clientRef) {
+        if (clientRef == null || clientRef.isBlank()) return null;
+        if (clientRef.startsWith("store:")) {
+            return clientRef.substring("store:".length()).trim();
+        }
+        return null;
+    }
+
+    private static SubscriptionStatus mapStripeSubscriptionStatus(String rawStatus, boolean cancelAtPeriodEnd, boolean canceled) {
+        if (rawStatus == null) return SubscriptionStatus.FREE;
+        final String s = rawStatus.trim().toLowerCase();
+        if (canceled || "canceled".equals(s)) return SubscriptionStatus.CANCELED;
+        switch (s) {
+            case "active": return SubscriptionStatus.ACTIVE;
+            case "trialing": return SubscriptionStatus.TRIALING;
+            case "past_due": return SubscriptionStatus.PAST_DUE;
+            case "paused": return SubscriptionStatus.SUSPENDED;
+            case "incomplete_expired":
+            case "unpaid": return SubscriptionStatus.EXPIRED;
+            case "incomplete":
+            default: return SubscriptionStatus.TRIALING;
+        }
+    }
+
+    private static OffsetDateTime toOffsetDateTimeOrNull(Long unixSeconds) {
+        if (unixSeconds == null) return null;
+        if (unixSeconds == 0L) return null;
+        try {
+            return java.time.Instant.ofEpochMilli(java.util.concurrent.TimeUnit.SECONDS.toMillis(unixSeconds))
+                    .atOffset(java.time.ZoneOffset.UTC);
+        } catch (Exception ex) {
+            return null;
         }
     }
 

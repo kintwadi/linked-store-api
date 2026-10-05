@@ -5,15 +5,10 @@ import com.vicinity24.core.linkedstore.api.entity.ProductStatus;
 import com.vicinity24.core.linkedstore.api.entity.ProductVariant;
 import com.vicinity24.core.linkedstore.api.entity.Store;
 import com.vicinity24.core.linkedstore.api.entity.SubscriptionStatus;
-import com.vicinity24.core.linkedstore.api.entity.UserAccount;
-import com.vicinity24.core.linkedstore.api.entity.UserRole;
-import com.vicinity24.core.linkedstore.api.entity.UserStatus;
 import com.vicinity24.core.linkedstore.api.entity.VariantStatus;
 import com.vicinity24.core.linkedstore.api.repository.ProductRepository;
 import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
-import com.vicinity24.core.linkedstore.api.repository.UserAccountRepository;
-import com.vicinity24.core.linkedstore.api.service.PasswordService;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
@@ -42,9 +37,6 @@ public class ProductCatalogSeeder {
     private final StoreRepository storeRepository;
     private final ProductRepository productRepository;
     private final ProductVariantRepository variantRepository;
-    private final UserAccountRepository userAccountRepository;
-    private final PasswordService passwordService;
-    private final AuthProperties authProperties;
 
     @PersistenceContext
     private EntityManager em;
@@ -90,8 +82,32 @@ public class ProductCatalogSeeder {
         runDdlSilently("ALTER TABLE store_users ALTER COLUMN is_global_admin DROP NOT NULL");
         runDdlSilently("ALTER TABLE store_users ALTER COLUMN phone_number DROP NOT NULL");
         runDdlSilently("CREATE UNIQUE INDEX IF NOT EXISTS idx_store_users_email ON store_users(email) WHERE email IS NOT NULL");
-
-        seedGlobalAdminUser();
+        runDdlSilently("""
+            DO $$
+            DECLARE
+                fk_name text := 'fkj5dbp5e9tqy3y60f14ej32dap';
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = fk_name AND table_name = 'store_users'
+                ) THEN
+                    EXECUTE format('ALTER TABLE store_users DROP CONSTRAINT %I', fk_name);
+                END IF;
+            END $$;
+            """);
+        runDdlSilently("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'fk_store_users_store' AND table_name = 'store_users'
+                ) THEN
+                    ALTER TABLE store_users
+                    ADD CONSTRAINT fk_store_users_store
+                    FOREIGN KEY (store_id) REFERENCES stores(id) ON DELETE CASCADE;
+                END IF;
+            END $$;
+            """);
 
         var storeDowntown = ensureStore("store-downtown-01",
                 "Kicks & Co. — Downtown Flagship",
@@ -248,7 +264,7 @@ public class ProductCatalogSeeder {
                         "https://images.unsplash.com/photo-1586350977771-b3b0abd50c82?auto=format&fit=crop&w=600&h=600&q=80")
         ));
 
-        storeRepository.deleteByStripeConnectIdStartingWith("acct_connected_");
+        deleteConnectedStoresSafely("acct_connected_");
 
         int backfilled = 0;
         for (Store s : storeRepository.findAll()) {
@@ -440,42 +456,62 @@ public class ProductCatalogSeeder {
         try {
             Session session = em.unwrap(Session.class);
             session.doWork(connection -> {
-                try (Statement stmt = connection.createStatement()) {
-                    stmt.execute(sql);
+                boolean autoCommitWas = connection.getAutoCommit();
+                java.sql.Savepoint sp = null;
+                try {
+                    if (!autoCommitWas) {
+                        sp = connection.setSavepoint("ddl_" + Long.toHexString(System.nanoTime() & 0xffffffffL));
+                    }
+                    try (Statement stmt = connection.createStatement()) {
+                        stmt.execute(sql);
+                    }
+                } catch (Exception e) {
+                    if (sp != null) {
+                        try { connection.rollback(sp); } catch (Exception ignore) {}
+                    }
+                    log.debug("DDL no-op (already exists or unsupported): {}", e.getMessage());
                 }
             });
         } catch (Exception e) {
-            log.debug("DDL no-op (already exists or unsupported): {}", e.getMessage());
+            log.debug("DDL no-op (EM-level): {}", e.getMessage());
         }
     }
 
-    private void seedGlobalAdminUser() {
+    private void deleteConnectedStoresSafely(String stripePrefix) {
         try {
-            List<UserAccount> existing = userAccountRepository.findGlobalAdmins();
-            if (existing != null && !existing.isEmpty()) {
-                log.info("Global admin users already exist: {}. Skip seeding.", existing.size());
-                return;
+            Session session = em.unwrap(Session.class);
+            int[] deleted = new int[1];
+            session.doWork(connection -> {
+                List<UUID> storeIds = new ArrayList<>();
+                try (java.sql.PreparedStatement ps = connection.prepareStatement(
+                        "SELECT id FROM stores WHERE stripe_connect_id LIKE ?")) {
+                    ps.setString(1, stripePrefix + "%");
+                    try (java.sql.ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) storeIds.add(UUID.fromString(rs.getString(1)));
+                    }
+                }
+                if (storeIds.isEmpty()) {
+                    deleted[0] = 0;
+                    return;
+                }
+                String placeholders = String.join(",", storeIds.stream().map(x -> "?").toList());
+                try (java.sql.PreparedStatement ps = connection.prepareStatement(
+                        "DELETE FROM store_users WHERE store_id IN (" + placeholders + ")")) {
+                    for (int i = 0; i < storeIds.size(); i++) ps.setObject(i + 1, storeIds.get(i));
+                    ps.executeUpdate();
+                }
+                try (java.sql.PreparedStatement ps = connection.prepareStatement(
+                        "DELETE FROM stores WHERE id IN (" + placeholders + ")")) {
+                    for (int i = 0; i < storeIds.size(); i++) ps.setObject(i + 1, storeIds.get(i));
+                    deleted[0] = ps.executeUpdate();
+                }
+            });
+            if (deleted[0] > 0) {
+                log.info("CatalogSeeder: safely deleted {} {} stores + referencing store_users",
+                        deleted[0], stripePrefix);
             }
         } catch (Exception e) {
-            log.warn("Cannot query global admins table (likely not yet created): {}", e.getMessage());
-            return;
+            log.warn("CatalogSeeder: skipping {} cleanup ({})", stripePrefix, e.getMessage());
         }
-        String email = authProperties.getDefaultAdminEmail() != null
-                ? authProperties.getDefaultAdminEmail() : "admin@linked.store";
-        String password = authProperties.getDefaultAdminPassword() != null
-                ? authProperties.getDefaultAdminPassword() : "Admin123!";
-        String salt = passwordService.generateSalt();
-        String hash = passwordService.hash(password, salt);
-        UserAccount admin = UserAccount.builder()
-                .name("Global Admin")
-                .email(email)
-                .passwordSalt(salt)
-                .passwordHash(hash)
-                .role(UserRole.GLOBAL_ADMIN)
-                .globalAdmin(true)
-                .status(UserStatus.ACTIVE)
-                .build();
-        admin = userAccountRepository.save(admin);
-        log.info("Seeded global admin user: email={} id={}", email, admin.getId());
     }
 }

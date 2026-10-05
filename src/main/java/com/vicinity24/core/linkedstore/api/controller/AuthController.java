@@ -249,6 +249,7 @@ public class AuthController {
                 .orElseThrow(() -> new ResourceNotFoundException("UserAccount", current.getUserId().toString()));
         CurrentUserResponse response = CurrentUserResponse.builder()
                 .id(user.getId())
+                .userId(user.getId())
                 .storeId(user.getStoreId())
                 .name(user.getName())
                 .email(user.getEmail())

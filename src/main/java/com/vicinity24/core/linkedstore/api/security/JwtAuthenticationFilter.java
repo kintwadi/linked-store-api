@@ -4,6 +4,7 @@ import com.vicinity24.core.linkedstore.api.entity.UserRole;
 import com.vicinity24.core.linkedstore.api.service.JwtService;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -31,9 +32,23 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private static final String BEARER = "Bearer ";
 
     @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return true;
+    }
+
+    @Override
+    protected boolean shouldNotFilterErrorDispatch() {
+        return true;
+    }
+
+    @Override
     protected void doFilterInternal(HttpServletRequest request,
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
+        if (request.getDispatcherType() != DispatcherType.REQUEST) {
+            filterChain.doFilter(request, response);
+            return;
+        }
         String token = null;
         String authHeader = request.getHeader(HttpHeaders.AUTHORIZATION);
         if (authHeader != null && !authHeader.isBlank() && authHeader.startsWith(BEARER)) {

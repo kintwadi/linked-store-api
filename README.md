@@ -262,7 +262,90 @@ named by `R2_BUCKET_NAME`).
 
 ---
 
-## 9. Developer Workflow (shortcuts)
+## 9. Docker & Render Deployment
+
+Two ways to run the backend in production: (a) pre-built JAR, (b) the included
+multi-stage **Dockerfile** — the default for the linked
+[Render Blueprint](file:///c:/Users/core101/Desktop/autocode/linked_store/render.yaml).
+
+### 9.1 Build the Docker image locally
+
+```bash
+docker build -t linked-store-api backend
+```
+
+The image is split in two stages:
+- `Stage 1 (builder)` — `maven:3.9-eclipse-temurin-17`, runs
+  `mvn -DskipTests package` then explodes the Spring Boot layered jar with
+  `jarmode=layertools` so only the smallest layer (application code) rebuilds
+  when Java sources change.
+- `Stage 2 (runtime)` — `eclipse-temurin:17-jre-jammy`, runs as non-root
+  `app` (uid 1001), exposes port 8080, sets container-friendly
+  `-XX:MaxRAMPercentage=75`, `-XX:InitialRAMPercentage=40`,
+  `-Djava.security.egd=file:/dev/./urandom`.
+
+Run the image against a local Postgres:
+
+```bash
+docker run --rm -it --name api -p 8080:8080 \
+  -e SPRING_DATASOURCE_URL=jdbc:postgresql://host.docker.internal:5432/linked_store \
+  -e SPRING_DATASOURCE_USERNAME=postgres \
+  -e SPRING_DATASOURCE_PASSWORD=postgres \
+  -e LINKEDSTORE_AUTH_JWT_SECRET='change-me-to-64-char-random-string!!OK' \
+  linked-store-api
+```
+
+### 9.2 One-click Render Blueprint
+
+In Render Dashboard → **Blueprints** → *New Blueprint Instance*, select the
+repo that contains both `backend/` and `frontend/` subfolders plus the
+repo-level `render.yaml`. Render will create:
+
+| Service | Plan | Purpose |
+|---|---|---|
+| `linked-store-db` | Starter Postgres 16 | Database (private by default, IP allow list empty) |
+| `linked-store-api` | Starter Web Service (Docker) | Spring Boot API — port 8080 |
+| `linked-store-frontend` | Starter Web Service (Docker) | Angular + nginx — proxies `/api` + `/products` to the API |
+
+Env vars wired automatically by the blueprint:
+- `SPRING_DATASOURCE_URL / USERNAME / PASSWORD` are filled from the Postgres
+  service via `fromService.property`.
+- `LINKEDSTORE_AUTH_JWT_SECRET` and the default admin password are
+  auto-generated with `generateValue: true`.
+- Frontend's `API_PROXY_URL` points to the backend service public URL.
+
+**Secrets you MUST still supply via Render Env Groups (never commit these):**
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`
+- `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`
+- `MAIL_USERNAME` / `MAIL_PASSWORD`
+- `LOCATION_IQ_API_KEY` (optional)
+- `API_BASE_ORIGIN` — set to your custom frontend domain so Stripe return
+  URLs + CORS work correctly after a Custom Domain attach.
+
+### 9.3 Runtime Env Vars — Quick Reference
+
+Every credential and toggle is exposed as an env var. `application.yml`
+defaults are listed in parentheses.
+
+| Variable | Scope |
+|---|---|
+| `SPRING_DATASOURCE_URL` | JDBC Postgres connection string |
+| `SERVER_PORT` | HTTP port (8080) |
+| `SERVER_ADDRESS` | Bind address (0.0.0.0) |
+| `LINKEDSTORE_AUTH_JWT_SECRET` | HS256 signing key for access tokens (64 chars minimum) |
+| `LINKEDSTORE_AUTH_ACCESS_TOKEN_MINUTES` | Access token TTL (30) |
+| `LINKEDSTORE_AUTH_REFRESH_TOKEN_DAYS` | Refresh token TTL (7) |
+| `LINKEDSTORE_PLATFORM_ROOT_ADMIN` | Seed GLOBAL_ADMIN on first boot? (true) |
+| `SEED_CATALOG` | Seed demo catalog + demo stores? (false on Render) |
+| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | Payment + webhook signature |
+| `MAIL_HOST` / `MAIL_PORT` / `MAIL_USERNAME` / `MAIL_PASSWORD` / `MAIL_SMTP_SSL_ENABLE` | Hostinger: `smtp.hostinger.com:465` + SSL |
+| `R2_*` | Cloudflare R2 image storage (keys, endpoint, bucket, public URL) |
+| `LOCATION_IQ_*` | Optional — store geocoding |
+| `API_BASE_ORIGIN` | Frontend public origin (used for Stripe return URLs) |
+
+---
+
+## 10. Developer Workflow (shortcuts)
 
 ```powershell
 cd backend

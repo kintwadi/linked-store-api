@@ -177,4 +177,28 @@ public class PermissionService {
             throw new PermissionDeniedException("role-at-least-" + minimum, null, "INSUFFICIENT_ROLE");
         }
     }
+
+    /**
+     * Access subscription / pricing pages, see plan status, upgrade / change plan.
+     * Allowed for GLOBAL_ADMIN (any store scope) OR OWNER/STORE_ADMIN on their own store.
+     */
+    public boolean canManageSubscription(CurrentUser caller, UUID storeId) {
+        return adminGuard.canManageSubscription(caller, storeId);
+    }
+
+    public void ensureCanManageSubscription(CurrentUser caller, UUID storeId) {
+        if (!canManageSubscription(caller, storeId)) {
+            throw new PermissionDeniedException("manage-subscription", storeId, "SUBSCRIPTION_MANAGE_UNAUTHORIZED");
+        }
+    }
+
+    public boolean canEditSubscriptionPlans(CurrentUser caller) {
+        return adminGuard.canEditSubscriptionPlans(caller);
+    }
+
+    public void ensureCanEditSubscriptionPlans(CurrentUser caller) {
+        if (!canEditSubscriptionPlans(caller)) {
+            throw new PermissionDeniedException("edit-subscription-plans", null, "GLOBAL_ADMIN_REQUIRED");
+        }
+    }
 }

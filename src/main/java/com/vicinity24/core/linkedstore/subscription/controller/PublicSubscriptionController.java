@@ -1,5 +1,8 @@
 package com.vicinity24.core.linkedstore.subscription.controller;
 
+import com.vicinity24.core.linkedstore.api.entity.SubscriptionPlan;
+import com.vicinity24.core.linkedstore.api.entity.SubscriptionPlanFeature;
+import com.vicinity24.core.linkedstore.api.repository.SubscriptionPlanRepository;
 import com.vicinity24.core.linkedstore.subscription.PlanTier;
 import com.vicinity24.core.linkedstore.subscription.SubscriptionTierSettings;
 import com.vicinity24.core.linkedstore.subscription.dto.PricingPlanResponse;
@@ -10,7 +13,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/subscription/v1")
@@ -19,15 +25,8 @@ import java.util.List;
 public class PublicSubscriptionController {
 
     private final SubscriptionTierSettings tierSettings;
+    private final SubscriptionPlanRepository planRepository;
 
-    /**
-     * Lists the two public pricing plans (PRO and CUSTOM).
-     *
-     * Badge placement convention: the PRO tier is tagged "Recommended" because it is the
-     * default self-serve plan targeted at most SMB stores. The CUSTOM tier is tagged
-     * "Enterprise" to surface it as an upsell path for stores hitting PRO quotas or
-     * needing bespoke commercial terms.
-     */
     @GetMapping("/plans")
     public List<PricingPlanResponse> listPlans() {
         List<PricingPlanResponse> plans = new ArrayList<>();
@@ -37,36 +36,18 @@ public class PublicSubscriptionController {
     }
 
     private PricingPlanResponse buildProPlan() {
+        Optional<SubscriptionPlan> dbOpt = planRepository.findByPlanCode("PRO");
+        if (dbOpt.isPresent() && Boolean.TRUE.equals(dbOpt.get().getIsActive())) {
+            return fromDbPlan(dbOpt.get(), PlanTier.PRO);
+        }
         SubscriptionTierSettings.TierProSettings pro = tierSettings.getPro();
-
         List<PricingPlanResponse.FeatureItem> features = List.of(
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("30-day free trial")
-                        .included(true)
-                        .highlight(true)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Unlimited connected stores")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Up to " + pro.getMonthlyOrderLimit() + " monthly orders")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Standard API & webhooks")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Email support")
-                        .included(true)
-                        .highlight(false)
-                        .build()
+                feature("30-day free trial", true, true),
+                feature("Unlimited connected stores", true, false),
+                feature("Up to " + pro.getMonthlyOrderLimit() + " monthly orders", true, false),
+                feature("Standard API & webhooks", true, false),
+                feature("Email support", true, false)
         );
-
         return PricingPlanResponse.builder()
                 .tier(PlanTier.PRO.name())
                 .displayName(PlanTier.PRO.getDisplayName())
@@ -85,36 +66,18 @@ public class PublicSubscriptionController {
     }
 
     private PricingPlanResponse buildCustomPlan() {
+        Optional<SubscriptionPlan> dbOpt = planRepository.findByPlanCode("CUSTOM");
+        if (dbOpt.isPresent() && Boolean.TRUE.equals(dbOpt.get().getIsActive())) {
+            return fromDbPlan(dbOpt.get(), PlanTier.CUSTOM);
+        }
         SubscriptionTierSettings.TierCustomSettings custom = tierSettings.getCustom();
-
         List<PricingPlanResponse.FeatureItem> features = List.of(
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Unlimited orders")
-                        .included(true)
-                        .highlight(true)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Dedicated success manager")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Custom integrations")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("Custom SLA")
-                        .included(true)
-                        .highlight(false)
-                        .build(),
-                PricingPlanResponse.FeatureItem.builder()
-                        .label("SAML SSO")
-                        .included(true)
-                        .highlight(false)
-                        .build()
+                feature("Unlimited orders", true, true),
+                feature("Dedicated success manager", true, false),
+                feature("Custom integrations", true, false),
+                feature("Custom SLA", true, false),
+                feature("SAML SSO", true, false)
         );
-
         return PricingPlanResponse.builder()
                 .tier(PlanTier.CUSTOM.name())
                 .displayName(custom.getDisplayName())
@@ -129,6 +92,60 @@ public class PublicSubscriptionController {
                 .monthlyOrderLimit(null)
                 .badges(new String[]{"Enterprise"})
                 .features(features)
+                .build();
+    }
+
+    private PricingPlanResponse fromDbPlan(SubscriptionPlan plan, PlanTier tier) {
+        List<SubscriptionPlanFeature> fs = plan.getFeatures() == null ? List.of() : plan.getFeatures();
+        List<PricingPlanResponse.FeatureItem> features = fs.stream()
+                .sorted(Comparator.comparingInt(f -> f.getDisplayOrder() == null ? 0 : f.getDisplayOrder()))
+                .map(f -> feature(f.getLabel(),
+                        f.getIncluded() == null ? Boolean.TRUE : f.getIncluded(),
+                        f.getHighlight() == null ? Boolean.FALSE : f.getHighlight()))
+                .collect(Collectors.toList());
+        String billingMonthly = plan.getBillingLabelMonthly();
+        String billingAnnual = plan.getBillingLabelAnnual();
+        if (tier == PlanTier.PRO) {
+            Integer monthly = plan.getPriceCents();
+            Integer annual = plan.getAnnualPriceCents();
+            if (billingMonthly == null && monthly != null) {
+                billingMonthly = "$" + (monthly / 100.0) + "/mo";
+            }
+            if (billingAnnual == null && annual != null) {
+                billingAnnual = "$" + String.format("%.2f", annual / 1200.0) + "/mo, billed annually";
+            }
+        } else if (tier == PlanTier.CUSTOM && Boolean.TRUE.equals(plan.getContactSalesEnabled())) {
+            if (billingMonthly == null) billingMonthly = "Contact sales";
+            if (billingAnnual == null) billingAnnual = "Custom pricing";
+        }
+        return PricingPlanResponse.builder()
+                .tier(tier.name())
+                .displayName(plan.getDisplayName())
+                .description(plan.getDescription())
+                .monthlyPriceCents(plan.getPriceCents())
+                .annualPriceCents(plan.getAnnualPriceCents())
+                .annualDiscountPercent(plan.getAnnualDiscountPercent())
+                .billingLabelMonthly(billingMonthly)
+                .billingLabelAnnual(billingAnnual)
+                .currency(plan.getCurrency())
+                .trialDays(plan.getTrialDays())
+                .monthlyOrderLimit(normalizeUnlimitedQuota(plan.getMonthlyOrderLimit()))
+                .badges(plan.getBadges() == null ? new String[0] : plan.getBadges())
+                .features(features)
+                .build();
+    }
+
+    private static Integer normalizeUnlimitedQuota(Integer v) {
+        if (v == null) return null;
+        if (v < 0 || v.equals(Integer.MAX_VALUE)) return null;
+        return v;
+    }
+
+    private static PricingPlanResponse.FeatureItem feature(String label, boolean included, boolean highlight) {
+        return PricingPlanResponse.FeatureItem.builder()
+                .label(label)
+                .included(included)
+                .highlight(highlight)
                 .build();
     }
 }

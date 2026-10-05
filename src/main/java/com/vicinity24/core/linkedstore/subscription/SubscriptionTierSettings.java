@@ -41,5 +41,7 @@ public class SubscriptionTierSettings {
 
         private String displayName = "Custom Plan";
         private boolean contactSalesEnabled = true;
+        private String contactSalesEmail = "sales@vicinity24.dev";
+        private String contactSalesUrl = "/pricing";
     }
 }
