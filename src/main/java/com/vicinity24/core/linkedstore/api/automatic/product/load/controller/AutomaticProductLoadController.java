@@ -26,7 +26,6 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1/stores/{storeId}/products/upload")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:4200"}, allowCredentials = "true", maxAge = 3600)
 public class AutomaticProductLoadController {
 
     private final AutomaticProductLoadService service;
