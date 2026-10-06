@@ -104,11 +104,40 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOriginPatterns(List.of("*"));
+        configuration.setAllowedOriginPatterns(Arrays.asList(
+                // ---- Production ----
+                "https://dinretail.com",
+                "https://www.dinretail.com",
+                "https://vicinity24api.com",
+                "https://www.vicinity24api.com",
+                // ---- Render staging / sub-domain variants ----
+                "https://*.dinretail.com",
+                "https://*.vicinity24api.com",
+                "https://*.onrender.com",
+                // ---- Local development (Angular CLI dev-server, ng serve) ----
+                "http://localhost:*",
+                "http://127.0.0.1:*",
+                "http://[::1]:*",
+                // ---- LAN / smartphone testing (WiFi adapter IPs) ----
+                "http://192.168.*:*",
+                "http://10.*:*",
+                "http://172.16.*:*",
+                "http://172.17.*:*",
+                "http://172.18.*:*",
+                "http://172.19.*:*",
+                "http://172.2*.*:*",
+                "http://172.30.*:*",
+                "http://172.31.*:*",
+                // ---- Catch-all for local http/https tunnel (ngrok, cloudflared, etc.) ----
+                "https://*.*.trycloudflare.com",
+                "https://*.ngrok-free.app",
+                "https://*.ngrok.io"
+        ));
         configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
         configuration.setAllowedHeaders(List.of("*"));
-        configuration.setExposedHeaders(Arrays.asList("Content-Type", "X-Request-Id", "Idempotency-Key", "Authorization"));
+        configuration.setExposedHeaders(Arrays.asList("Content-Type", "X-Request-Id", "Idempotency-Key", "Authorization", "X-Forwarded-For", "X-Real-IP"));
         configuration.setAllowCredentials(true);
+        configuration.setMaxAge(3600L);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);
         return source;

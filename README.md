@@ -265,8 +265,7 @@ named by `R2_BUCKET_NAME`).
 ## 9. Docker & Render Deployment
 
 Two ways to run the backend in production: (a) pre-built JAR, (b) the included
-multi-stage **Dockerfile** — the default for the linked
-[Render Blueprint](file:///c:/Users/core101/Desktop/autocode/linked_store/render.yaml).
+multi-stage **Dockerfile** (the default path for Render hosting).
 
 ### 9.1 Build the Docker image locally
 
@@ -295,32 +294,75 @@ docker run --rm -it --name api -p 8080:8080 \
   linked-store-api
 ```
 
-### 9.2 One-click Render Blueprint
+### 9.2 Render Deployment (Dashboard, 2 separate repos)
 
-In Render Dashboard → **Blueprints** → *New Blueprint Instance*, select the
-repo that contains both `backend/` and `frontend/` subfolders plus the
-repo-level `render.yaml`. Render will create:
+Backend and frontend live in **two separate GitHub repos**
+(`linked-store-api` and `linked-store-client`), so they are deployed as
+**two independent Render Web Services** plus one Render Postgres DB, all
+provisioned from the Render Dashboard (no shared Blueprint YAML).
 
-| Service | Plan | Purpose |
-|---|---|---|
-| `linked-store-db` | Starter Postgres 16 | Database (private by default, IP allow list empty) |
-| `linked-store-api` | Starter Web Service (Docker) | Spring Boot API — port 8080 |
-| `linked-store-frontend` | Starter Web Service (Docker) | Angular + nginx — proxies `/api` + `/products` to the API |
+**Step 1 — Database**
+- Dashboard → **PostgreSQL** → **New PostgreSQL**.
+- Name = `linked-store-db`; Postgres Version = `16`; Plan = `Starter`;
+  Region = `Oregon` (matches both web services).
+- Click **Create Database** → wait until status = "Available".
+- Copy these 3 values for **Step 2**: `Internal Database URL`, `Username`,
+  `Password`.
 
-Env vars wired automatically by the blueprint:
-- `SPRING_DATASOURCE_URL / USERNAME / PASSWORD` are filled from the Postgres
-  service via `fromService.property`.
-- `LINKEDSTORE_AUTH_JWT_SECRET` and the default admin password are
-  auto-generated with `generateValue: true`.
-- Frontend's `API_PROXY_URL` points to the backend service public URL.
+**Step 2 — Backend Web Service**
+- Dashboard → **Web Services** → **New Web Service** → connect repo
+  `kintwadi/linked-store-api`, branch = `_home_dev`.
+- Runtime = **Docker**; Dockerfile = `./Dockerfile` (at repo root).
+- Plan = Starter (1); Region = Oregon; Health Check Path = `/`.
+- **Environment → Add from .env (or paste these one by one):**
+  - `SERVER_PORT=8080`
+  - `SERVER_ADDRESS=0.0.0.0`
+  - `SPRING_JPA_HIBERNATE_DDL_AUTO=update`
+  - `SPRING_DATASOURCE_URL=<Internal Database URL from Step 1>`
+  - `SPRING_DATASOURCE_USERNAME=<Username from Step 1>`
+  - `SPRING_DATASOURCE_PASSWORD=<Password from Step 1>`
+  - `LINKEDSTORE_AUTH_JWT_SECRET` → use **Generate** (Render feature) → a
+    random 64+ char string is produced.
+  - `LINKEDSTORE_AUTH_DEFAULT_ADMIN_PASSWORD` → also Generate.
+  - `LINKEDSTORE_AUTH_ISSUER=linked-store`
+  - `LINKEDSTORE_AUTH_ACCESS_TOKEN_MINUTES=30`
+  - `LINKEDSTORE_AUTH_REFRESH_TOKEN_DAYS=7`
+  - `LINKEDSTORE_AUTH_DEFAULT_ADMIN_EMAIL=admin@linked.store`
+  - `LINKEDSTORE_PLATFORM_ROOT_ADMIN=true`
+  - `SEED_CATALOG=false`
+  - `API_BASE_ORIGIN=https://dinretail.com`
+  - `API_BASE_URL=https://vicinity24api.com`
+  - `LINKEDSTORE_API_PUBLIC_URL=https://vicinity24api.com`
+  - `LINKEDSTORE_CONNECT_FRONTEND_RETURN_URL=https://dinretail.com/admin`
+  - `LINKEDSTORE_CONNECT_FRONTEND_REFRESH_URL=https://dinretail.com/admin`
+  - `LINKEDSTORE_BRAND_DISPLAY_NAME=Linked-Store`
+- Paste the **SECRET** vars via an Env Group (recommended, single source of
+  truth, secret-scoped):
+  `STRIPE_SECRET_KEY`, `STRIPE_PUBLIC_KEY`, `STRIPE_WEBHOOK_SECRET`,
+  `SUBSCRIPTION_PLUS_STRIPE_PRICE_ID`, `SUBSCRIPTION_PRO_STRIPE_PRICE_ID`,
+  `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`,
+  `MAIL_SMTP_SSL_ENABLE`, `MAIL_SMTP_STARTTLS_ENABLE`,
+  `MAIL_SMTP_SSL_TRUST`, `MAIL_FROM`, `MAIL_CONTACT_SALES_TO`,
+  `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+  `R2_BUCKET_NAME`, `R2_ENDPOINT`, `R2_PUBLIC_URL`,
+  `LOCATION_IQ_API_KEY`, `LOCATION_IQ_BASE_URL`,
+  `LOCATION_IQ_COUNTRYCODES`, `LOCATION_IQ_TIMEOUT_MS`.
+  Use the corresponding values in `backend/render.env` as your paste
+  checklist (do NOT commit that file to GitHub — just copy its contents
+  into the Env Group editor).
+- Click **Create Web Service**. Once it boots (green "Live"), go to
+  Settings → **Custom Domains** → Add `vicinity24api.com` +
+  `www.vicinity24api.com`. Follow Render's CNAME/ALIAS/APEX instructions
+  for your DNS host. Wait until the page shows "Active → Connected"
+  (TLS cert issued). Copy the final public URL — you need it for Step 3.
 
-**Secrets you MUST still supply via Render Env Groups (never commit these):**
-- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`
-- `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`
-- `MAIL_USERNAME` / `MAIL_PASSWORD`
-- `LOCATION_IQ_API_KEY` (optional)
-- `API_BASE_ORIGIN` — set to your custom frontend domain so Stripe return
-  URLs + CORS work correctly after a Custom Domain attach.
+**Step 3 — Frontend Web Service** (same flow, using frontend repo):
+- Web Service → connect repo `kintwadi/linked-store-client`, branch `main`.
+- Runtime = **Docker**; Dockerfile = `./Dockerfile`; Plan = Starter.
+- Env: `API_PROXY_URL=https://vicinity24api.com` (or, while Custom
+  Domains are still provisioning, paste the backend service's
+  `*.onrender.com` URL as a temporary fallback).
+- Custom Domains → Add `dinretail.com` + `www.dinretail.com`.
 
 ### 9.3 Runtime Env Vars — Quick Reference
 

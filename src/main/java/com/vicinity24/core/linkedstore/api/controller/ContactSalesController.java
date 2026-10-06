@@ -28,9 +28,6 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 @RestController
 @RequestMapping("/api/contact-sales")
-@CrossOrigin(origins = {"http://localhost:4200"}, allowCredentials = "true",
-        methods = {RequestMethod.OPTIONS, RequestMethod.POST},
-        allowedHeaders = {"Origin", "Content-Type", "Accept", "Authorization"})
 @RequiredArgsConstructor
 public class ContactSalesController {
 

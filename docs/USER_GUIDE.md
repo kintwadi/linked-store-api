@@ -213,16 +213,33 @@ user pick specific transaction_items + quantities before submitting.
 
 ## 10. Docker & Render Deployment
 
-The backend ships with a multi-stage Dockerfile + Render blueprint.
+The backend ships with a multi-stage Dockerfile. Render hosts it as a
+standalone Docker Web Service alongside the Angular frontend web service
+and a managed Postgres 16 database (see also `backend/README.md §9`).
 
 - Build image locally:
   ```
   docker build -t linked-store-api backend
   ```
-- Deploy with Render Blueprint: push to GitHub and open `render.yaml` in
-  the Render Dashboard → Blueprints → New Blueprint Instance. A Postgres 16
-  DB plus the API service + the Angular frontend service are created for you.
-- Required env vars (the blueprint documents all of them):
+- Deploy to Render (Dashboard, 2-repo setup since backend and frontend live
+  in separate GitHub repos):
+  1. Create a Postgres DB (`linked-store-db`, v16, Starter plan) via
+     Render Dashboard → PostgreSQL. Copy the internal URL/username/password.
+  2. Create **Web Service 1 (API)** → connect
+     `kintwadi/linked-store-api.git` branch `_home_dev`, runtime = Docker,
+     Dockerfile `./Dockerfile`, plan = Starter. Paste the 3 DB values plus
+     the rest of the env vars listed in `backend/render.env` (use the file
+     as a paste checklist — don't commit it). After deploy, attach the
+     Custom Domain `vicinity24api.com` + `www.vicinity24api.com` under
+     Settings → Custom Domains.
+  3. Create **Web Service 2 (Frontend)** → connect
+     `kintwadi/linked-store-client.git` branch `main`, runtime = Docker,
+     Dockerfile `./Dockerfile`, env `API_PROXY_URL=https://vicinity24api.com`
+     (or the backend `*.onrender.com` URL temporarily until custom-domain
+     DNS validates), then attach Custom Domain `dinretail.com` +
+     `www.dinretail.com`.
+- Required env vars (paste all of them into Render Env Groups + the
+  per-service Environment tab):
   `SPRING_DATASOURCE_URL`, `LINKEDSTORE_AUTH_JWT_SECRET`,
   `STRIPE_SECRET_KEY`, `MAIL_HOST`/`MAIL_USERNAME`/`MAIL_PASSWORD`,
   `API_BASE_ORIGIN`, `LINKEDSTORE_PLATFORM_ROOT_ADMIN`,
