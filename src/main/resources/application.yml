@@ -1,11 +1,11 @@
-﻿spring:
+spring:
   application:
-    name: ${APPLICATION_NAME}
+    name: ${APPLICATION_NAME:Linked Store}
 
   datasource:
-    url: jdbc:postgresql://${DB_HOST}:5432/${DB_NAME}?sslmode=${SSL_MODE:prefer}
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:linked_store}?sslmode=${SSL_MODE:prefer}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 20
@@ -22,8 +22,8 @@
 
   jpa:
     hibernate:
-      ddl-auto: update
-    show-sql: true
+      ddl-auto: ${SPRING_JPA_HIBERNATE_DDL_AUTO:update}
+    show-sql: ${SPRING_JPA_SHOW_SQL:true}
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
@@ -73,7 +73,7 @@ stripe:
   webhook-secret: ${STRIPE_WEBHOOK_SECRET:whsec_placeholder}
   platform-fee-percent: 0
   connect:
-    webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+    webhook-secret: ${STRIPE_CONNECT_WEBHOOK_SECRET:}
   subscription:
     plus-price-id: ${SUBSCRIPTION_PLUS_STRIPE_PRICE_ID:}
     pro-price-id: ${SUBSCRIPTION_PRO_STRIPE_PRICE_ID:}
@@ -114,7 +114,7 @@ management:
         enabled: false
 
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
   address: 0.0.0.0
   servlet:
     context-path: /
@@ -124,7 +124,7 @@ seed:
 
 platform:
   root:
-    admin: ${LINKEDSTORE_PLATFORM_ROOT_ADMIN}
+    admin: ${LINKEDSTORE_PLATFORM_ROOT_ADMIN:true}
 
 linkedstore:
   brand:
@@ -137,7 +137,14 @@ linkedstore:
     issuer: ${LINKEDSTORE_AUTH_ISSUER:linked-store}
     default-admin-email: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_EMAIL:admin@linked.store}
     default-admin-password: ${LINKEDSTORE_AUTH_DEFAULT_ADMIN_PASSWORD:Admin123!}
+    # ---- Render production default = https://dinretail.com
+    #      Local dev fallback = http://localhost:4200 (ng serve)
     api-base-origin: ${API_BASE_ORIGIN:http://localhost:4200}
+  connect:
+    # ---- Stripe Connect onboarding return URLs. Production defaults are
+    #      dinretail.com/admin; local dev falls back to localhost:4200/admin.
+    frontend-return-url: ${LINKEDSTORE_CONNECT_FRONTEND_RETURN_URL:https://dinretail.com/admin}
+    frontend-refresh-url: ${LINKEDSTORE_CONNECT_FRONTEND_REFRESH_URL:https://dinretail.com/admin}
   geocoding:
     locationiq:
       api-key: ${LOCATION_IQ_API_KEY:}
