@@ -1,14 +1,35 @@
 -- =============================================================
 --  Linked-Store Backend — Complete PostgreSQL Schema
---  Last updated 2026-10-04.
+--  Last updated 2026-10-08.
 --
---  Run this ONCE against a Postgres 15+ database named
---  `linked_store` BEFORE the first `java -jar` / Docker start.
+--  FRESH INSTALL / BRAND NEW DATABASE INSTRUCTIONS:
+--    Run ONLY this file against Postgres 15+ BEFORE the first
+--    `java -jar` / Docker start.
 --
---  Spring Boot uses `spring.jpa.hibernate.ddl-auto=update` in
---  application.yml, so once all columns below exist, Hibernate
---  will safely track new ones; re-running this file is safe as
---  every statement is `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`.
+--  IMPORTANT:
+--    On PROD Render deployments, the Spring Boot container sets
+--    `SPRING_JPA_HIBERNATE_DDL_AUTO=none` — Hibernate will NEVER
+--    create/alter tables at boot, so you MUST apply this file
+--    manually via Render Postgres Interactive PSQL or external
+--    psql client BEFORE starting (or redeploying) the backend.
+--
+--  UPGRADES OF LEGACY / EXISTING DATABASES WITH PRODUCTION DATA:
+--    Do NOT re-run this file. Instead use the companion
+--    `migrate_subscription_plans_schema.sql` script that performs
+--    safe ADD COLUMN IF NOT EXISTS / backfill / DROP CONSTRAINT
+--    IF EXISTS steps idempotently without data loss.
+--
+--  RESETTING A DATABASE (dev or accidental schema drift):
+--    Run `drop_all_tables.sql` first (removes every table, FK,
+--    user-defined type, Flyway/Liquibase changelog tables), then
+--    re-run THIS file from scratch.
+--
+--  Idempotency: every CREATE TABLE / ADD CONSTRAINT / CREATE INDEX
+--  statement below uses IF NOT EXISTS (or DROP IF EXISTS patterns
+--  for the circular FK at the end), so re-running this file on a
+--    fresh DB after `drop_all_tables.sql` is harmless. On a DB
+--    that already has these tables, any duplicate object is
+--    skipped with a Postgres NOTICE (not an error).
 -- =============================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -24,7 +45,10 @@ CREATE TABLE IF NOT EXISTS stores (
     country_code VARCHAR(2) DEFAULT 'US',
     currency_code VARCHAR(3) DEFAULT 'USD',
     stripe_connect_id VARCHAR(255) NOT NULL,
-    subscription_status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    subscription_status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE'
+        CHECK (subscription_status IN (
+            'ACTIVE','TRIALING','PAST_DUE','CANCELED','EXPIRED','FREE','SUSPENDED'
+        )),
     logo_url VARCHAR(1024),
     hero_image_url VARCHAR(1024),
     address TEXT DEFAULT '',
@@ -33,6 +57,9 @@ CREATE TABLE IF NOT EXISTS stores (
     active_subscription_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_stores_sub_status  ON stores(subscription_status);
+CREATE INDEX IF NOT EXISTS idx_stores_country     ON stores(country_code);
 
 -- =============================================================
 --  2. store_users  (reused as `UserAccount` table — JPA entity
@@ -57,12 +84,16 @@ CREATE TABLE IF NOT EXISTS store_users (
     password_hash VARCHAR(512),
     refresh_token_hash VARCHAR(512),
 
+    -- runner auth (4-digit PIN + static API-key digest, both salted)
+    pin_hash     VARCHAR(512),
+    api_key_hash VARCHAR(512),
+
     -- global admin toggle (role + this flag are both checked)
     is_global_admin BOOLEAN NOT NULL DEFAULT FALSE,
 
-    -- lifecycle
+    -- lifecycle. Java enum UserStatus = ACTIVE, INVITED, SUSPENDED, DELETED.
     status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE'
-        CHECK (status IN ('ACTIVE','SUSPENDED','INVITED','LOCKED')),
+        CHECK (status IN ('ACTIVE','INVITED','SUSPENDED','DELETED')),
     last_login_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ
@@ -121,6 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_products_status         ON products(status);
 
 -- =============================================================
 --  5. product_variants  (store SKUs — stock + prices live here)
+--     Java VariantStatus enum: ACTIVE,DRAFT,PENDING,
+--     OUT_OF_STOCK,INACTIVE,ARCHIVED,DISABLED (7 values).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS product_variants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -135,7 +168,9 @@ CREATE TABLE IF NOT EXISTS product_variants (
     variant_attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
     version INT NOT NULL DEFAULT 0,
     status VARCHAR(50) NOT NULL DEFAULT 'ACTIVE'
-        CHECK (status IN ('ACTIVE','OUT_OF_STOCK','INACTIVE','DISCONTINUED')),
+        CHECK (status IN (
+            'ACTIVE','DRAFT','PENDING','OUT_OF_STOCK','INACTIVE','ARCHIVED','DISABLED'
+        )),
 
     image_url VARCHAR(1024),
     gallery_image_urls JSONB DEFAULT '[]'::jsonb,
@@ -215,6 +250,8 @@ CREATE INDEX IF NOT EXISTS idx_plan_features_plan ON subscription_plan_features(
 
 -- =============================================================
 --  8. subscriptions  (per-store lifecycle record; provider = Stripe)
+--     Java SubscriptionStatus enum: ACTIVE,TRIALING,PAST_DUE,
+--     CANCELED,EXPIRED,FREE,SUSPENDED (7 values).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS subscriptions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -223,7 +260,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
     status VARCHAR(30) NOT NULL DEFAULT 'TRIALING'
         CHECK (status IN (
-            'TRIALING','ACTIVE','PAST_DUE','UNPAID','CANCELED','INACTIVE','EXPIRED'
+            'ACTIVE','TRIALING','PAST_DUE','CANCELED','EXPIRED','FREE','SUSPENDED'
         )),
     provider VARCHAR(20) NOT NULL DEFAULT 'STRIPE'
         CHECK (provider IN ('STRIPE','MANUAL','INVOICE')),
@@ -258,6 +295,9 @@ ALTER TABLE stores
 
 -- =============================================================
 --  9. transactions  (cross-store order ledger)
+--     Java TransactionStatus enum: PENDING_RESERVATION,
+--     REQUESTED,RESERVED,READY,PAID,PICKED_UP,EXPIRED,CANCELED
+--     (8 values).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -267,18 +307,14 @@ CREATE TABLE IF NOT EXISTS transactions (
     total_retail_cents     INT NOT NULL,
     wholesale_payout_cents INT NOT NULL,
     arbitrage_margin_cents INT NOT NULL,
-    platform_fee_cents     INT NOT NULL DEFAULT 0,
     status VARCHAR(50) NOT NULL
         CHECK (status IN (
-            'CREATED','AWAITING_PAYMENT','PAID','PROCESSING',
-            'READY_FOR_PICKUP','IN_TRANSIT','DELIVERED','COMPLETED',
-            'CANCELLED','REFUNDED','FAILED'
+            'PENDING_RESERVATION','REQUESTED','RESERVED','READY',
+            'PAID','PICKED_UP','EXPIRED','CANCELED'
         )),
     runner_id UUID REFERENCES store_users(id) ON DELETE SET NULL,
-    customer_name  VARCHAR(255),
-    customer_email VARCHAR(255),
-    customer_phone VARCHAR(50),
-    notes TEXT,
+    product_id UUID REFERENCES products(id)          ON DELETE SET NULL,
+    variant_id UUID REFERENCES product_variants(id)  ON DELETE SET NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_distinct_stores CHECK (originating_store_id <> fulfilling_store_id)
@@ -289,6 +325,8 @@ CREATE INDEX IF NOT EXISTS idx_transactions_fulfilling  ON transactions(fulfilli
 CREATE INDEX IF NOT EXISTS idx_transactions_status      ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_transactions_created     ON transactions(created_at);
 CREATE INDEX IF NOT EXISTS idx_transactions_runner      ON transactions(runner_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_product     ON transactions(product_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_variant     ON transactions(variant_id);
 
 -- =============================================================
 --  10. transaction_items
@@ -297,21 +335,20 @@ CREATE TABLE IF NOT EXISTS transaction_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
     variant_id     UUID NOT NULL REFERENCES product_variants(id),
-    quantity       INT NOT NULL DEFAULT 1,
-    unit_wholesale_cents INT,
-    unit_retail_cents    INT
+    quantity       INT NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_transaction_items_transaction ON transaction_items(transaction_id);
 CREATE INDEX IF NOT EXISTS idx_transaction_items_variant     ON transaction_items(variant_id);
 
 -- =============================================================
 --  11. refunds (Stripe-side payout reversal, linked to a txn)
+--      Java RefundStatus enum: PENDING,PROCESSING,COMPLETED,FAILED
 -- =============================================================
 CREATE TABLE IF NOT EXISTS refunds (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
     status VARCHAR(50) NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING','SUCCEEDED','FAILED','CANCELED')),
+        CHECK (status IN ('PENDING','PROCESSING','COMPLETED','FAILED')),
     total_refunded_cents     INT NOT NULL,
     reversed_fulfiller_cents INT,
     reversed_originator_cents INT,
@@ -329,6 +366,8 @@ CREATE INDEX IF NOT EXISTS idx_refunds_status         ON refunds(status);
 
 -- =============================================================
 --  12. returned_inspection_records (post-refund QC on variants)
+--      Java InspectionStatus enum: UNDER_INSPECTION,
+--      PASSED_INSPECTION, REJECTED, RESTOCKED (4 values).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS returned_inspection_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -359,6 +398,8 @@ CREATE INDEX IF NOT EXISTS idx_rir_status         ON returned_inspection_records
 
 -- =============================================================
 --  13. inventory_locks  (2-phase stock reservation)
+--      Java InventoryLockStatus enum: HELD,RELEASED_TO_SALE,
+--      RELEASED_TO_STOCK (3 values).
 -- =============================================================
 CREATE TABLE IF NOT EXISTS inventory_locks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -368,7 +409,7 @@ CREATE TABLE IF NOT EXISTS inventory_locks (
     locked_quantity INT NOT NULL DEFAULT 1,
     expires_at TIMESTAMPTZ NOT NULL,
     status VARCHAR(50) NOT NULL DEFAULT 'HELD'
-        CHECK (status IN ('HELD','RELEASED','CONFIRMED','EXPIRED')),
+        CHECK (status IN ('HELD','RELEASED_TO_SALE','RELEASED_TO_STOCK')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_inventory_locks_expiry  ON inventory_locks(expires_at, status);
@@ -383,11 +424,12 @@ CREATE TABLE IF NOT EXISTS qr_tokens (
     transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
     runner_id      UUID NOT NULL REFERENCES store_users(id)   ON DELETE CASCADE,
     secure_token   VARCHAR(255) UNIQUE NOT NULL,
-    fallback_code  VARCHAR(16)  UNIQUE,
+    fallback_code  VARCHAR(16)  UNIQUE NOT NULL,
     expires_at     TIMESTAMPTZ NOT NULL,
     scanned_at     TIMESTAMPTZ
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_qr_secure_token    ON qr_tokens(secure_token);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_qr_fallback_code   ON qr_tokens(fallback_code);
 CREATE INDEX IF NOT EXISTS idx_qr_tokens_transaction     ON qr_tokens(transaction_id);
 CREATE INDEX IF NOT EXISTS idx_qr_tokens_runner          ON qr_tokens(runner_id);
 CREATE INDEX IF NOT EXISTS idx_qr_tokens_expiry          ON qr_tokens(expires_at);
@@ -395,5 +437,4 @@ CREATE INDEX IF NOT EXISTS idx_qr_tokens_expiry          ON qr_tokens(expires_at
 -- =============================================================
 --  15. store geolocation coverage index (used by store-search)
 -- =============================================================
-CREATE INDEX IF NOT EXISTS idx_stores_gps ON stores(latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_stores_subscription_status ON stores(subscription_status);
+CREATE INDEX IF NOT EXISTS idx_stores_lat_lng ON stores(latitude, longitude);
