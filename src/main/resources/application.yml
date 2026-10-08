@@ -1,6 +1,6 @@
 ﻿spring:
   application:
-    name: Linked Store
+    name: ${APPLICATION_NAME}
 
   datasource:
     url: ${SPRING_DATASOURCE_URL}
