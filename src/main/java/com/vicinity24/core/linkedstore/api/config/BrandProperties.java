@@ -9,6 +9,6 @@ import org.springframework.context.annotation.Configuration;
 @ConfigurationProperties(prefix = "linkedstore.brand")
 public class BrandProperties {
 
-    private String displayName = "Linked-Store";
+    private String displayName = "DinRetail";
     private String contactSalesTo = "info@vicinity24.com";
 }

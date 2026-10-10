@@ -1,6 +1,6 @@
 spring:
   application:
-    name: ${APPLICATION_NAME:Linked Store}
+    name: ${APPLICATION_NAME:DinRetail}
 
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:linked_store}?sslmode=${SSL_MODE:prefer}
@@ -128,7 +128,7 @@ platform:
 
 linkedstore:
   brand:
-    display-name: ${LINKEDSTORE_BRAND_DISPLAY_NAME:Linked-Store}
+    display-name: ${LINKEDSTORE_BRAND_DISPLAY_NAME:DinRetail}
     contact-sales-to: ${MAIL_CONTACT_SALES_TO:info@vicinity24.com}
   auth:
     jwt-secret: ${LINKEDSTORE_AUTH_JWT_SECRET:linked-store-dev-super-secret-key-please-change-in-production-64chars-Minimum!!OK}
