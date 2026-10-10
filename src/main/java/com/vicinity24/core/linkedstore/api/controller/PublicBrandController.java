@@ -13,7 +13,7 @@ import java.util.Map;
 @CrossOrigin(origins = "*", maxAge = 3600)
 public class PublicBrandController {
 
-    @Value("${spring.application.name:DinRetail}")
+    @Value("${linkedstore.brand.public-display-name:DinRetail}")
     private String applicationName;
 
     @GetMapping("")

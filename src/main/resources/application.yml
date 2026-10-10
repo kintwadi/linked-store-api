@@ -129,6 +129,7 @@ platform:
 linkedstore:
   brand:
     display-name: ${LINKEDSTORE_BRAND_DISPLAY_NAME:DinRetail}
+    public-display-name: DinRetail
     contact-sales-to: ${MAIL_CONTACT_SALES_TO:info@vicinity24.com}
   auth:
     jwt-secret: ${LINKEDSTORE_AUTH_JWT_SECRET:linked-store-dev-super-secret-key-please-change-in-production-64chars-Minimum!!OK}
