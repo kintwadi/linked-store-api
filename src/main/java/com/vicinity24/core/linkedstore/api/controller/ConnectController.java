@@ -488,9 +488,12 @@ public class ConnectController {
             if (dataObject instanceof Account account) {
                 return account.getId();
             }
-            final com.google.gson.JsonObject raw = event.getDataObjectDeserializer().getRawJsonObject();
-            if (raw != null && raw.has("id") && raw.get("id").isJsonPrimitive()) {
-                return raw.get("id").getAsString();
+            final String rawJson = event.getDataObjectDeserializer().getRawJson();
+            if (rawJson != null) {
+                final com.google.gson.JsonObject raw = new Gson().fromJson(rawJson, com.google.gson.JsonObject.class);
+                if (raw != null && raw.has("id") && raw.get("id").isJsonPrimitive()) {
+                    return raw.get("id").getAsString();
+                }
             }
         } catch (Exception ignored) {
         }
@@ -577,6 +580,19 @@ public class ConnectController {
         }
     }
 
+    private static com.stripe.model.InvoiceLineItem firstInvoiceLine(com.stripe.model.Invoice invoice) {
+        if (invoice == null || invoice.getLines() == null || invoice.getLines().getData() == null
+                || invoice.getLines().getData().isEmpty()) {
+            return null;
+        }
+        return invoice.getLines().getData().get(0);
+    }
+
+    private static String extractSubscriptionIdFromInvoice(com.stripe.model.Invoice invoice) {
+        final com.stripe.model.InvoiceLineItem line = firstInvoiceLine(invoice);
+        return line != null ? line.getSubscription() : null;
+    }
+
     private void handleCustomerSubscriptionEvent(Event event) {
         try {
             final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
@@ -617,8 +633,6 @@ public class ConnectController {
             sub.setProviderSubscriptionId(stripeSub.getId());
             sub.setProviderCustomerId(stripeSub.getCustomer());
             sub.setCancelAtPeriodEnd(Boolean.TRUE.equals(stripeSub.getCancelAtPeriodEnd()));
-            sub.setCurrentPeriodStart(toOffsetDateTimeOrNull(stripeSub.getCurrentPeriodStart()));
-            sub.setCurrentPeriodEnd(toOffsetDateTimeOrNull(stripeSub.getCurrentPeriodEnd()));
             sub.setTrialStart(toOffsetDateTimeOrNull(stripeSub.getTrialStart()));
             sub.setTrialEnd(toOffsetDateTimeOrNull(stripeSub.getTrialEnd()));
             if (Boolean.TRUE.equals(stripeSub.getCancelAtPeriodEnd()) && sub.getCanceledAt() == null) {
@@ -641,26 +655,18 @@ public class ConnectController {
         try {
             final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
             if (!(dataObject instanceof com.stripe.model.Invoice invoice)) return;
-            final String providerSubId = invoice.getSubscription();
+            final String providerSubId = extractSubscriptionIdFromInvoice(invoice);
             if (providerSubId == null) return;
+            final com.stripe.model.InvoiceLineItem firstLine = firstInvoiceLine(invoice);
             final Subscription existing = subscriptionRepository
                     .findByProviderSubscriptionId(providerSubId)
                     .orElseGet(() -> {
                         String storeIdRaw = null;
                         try {
-                            if (invoice.getLines() != null
-                                    && invoice.getLines().getData() != null
-                                    && !invoice.getLines().getData().isEmpty()
-                                    && invoice.getLines().getData().get(0) != null) {
-                                com.stripe.model.InvoiceLineItem line = invoice.getLines().getData().get(0);
-                                if (line.getMetadata() != null && line.getMetadata().get("storeId") != null) {
-                                    storeIdRaw = line.getMetadata().get("storeId");
-                                }
+                            if (firstLine != null && firstLine.getMetadata() != null && firstLine.getMetadata().get("storeId") != null) {
+                                storeIdRaw = firstLine.getMetadata().get("storeId");
                             }
                         } catch (Exception ignore) { storeIdRaw = null; }
-                        if (storeIdRaw == null && invoice.getSubscriptionDetails() != null && invoice.getSubscriptionDetails().getMetadata() != null) {
-                            storeIdRaw = invoice.getSubscriptionDetails().getMetadata().get("storeId");
-                        }
                         if (storeIdRaw == null) {
                             try {
                                 com.stripe.model.Subscription sub = com.stripe.model.Subscription.retrieve(providerSubId);
@@ -682,8 +688,13 @@ public class ConnectController {
                 log.debug("Connect: invoice.paid missing storeId providerSub={} invoice={}", providerSubId, invoice.getId());
                 return;
             }
-            existing.setCurrentPeriodStart(toOffsetDateTimeOrNull(invoice.getPeriodStart()));
-            existing.setCurrentPeriodEnd(toOffsetDateTimeOrNull(invoice.getPeriodEnd()));
+            if (firstLine != null && firstLine.getPeriod() != null) {
+                existing.setCurrentPeriodStart(toOffsetDateTimeOrNull(firstLine.getPeriod().getStart()));
+                existing.setCurrentPeriodEnd(toOffsetDateTimeOrNull(firstLine.getPeriod().getEnd()));
+            } else {
+                existing.setCurrentPeriodStart(toOffsetDateTimeOrNull(invoice.getPeriodStart()));
+                existing.setCurrentPeriodEnd(toOffsetDateTimeOrNull(invoice.getPeriodEnd()));
+            }
             if (existing.getStatus() != SubscriptionStatus.ACTIVE && existing.getStatus() != SubscriptionStatus.CANCELED && existing.getStatus() != SubscriptionStatus.EXPIRED) {
                 existing.setStatus(SubscriptionStatus.ACTIVE);
             }
@@ -702,7 +713,7 @@ public class ConnectController {
         try {
             final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
             if (!(dataObject instanceof com.stripe.model.Invoice invoice)) return;
-            final String providerSubId = invoice.getSubscription();
+            final String providerSubId = extractSubscriptionIdFromInvoice(invoice);
             if (providerSubId == null) return;
             subscriptionRepository.findByProviderSubscriptionId(providerSubId).ifPresent(sub -> {
                 if (sub.getStatus() != SubscriptionStatus.CANCELED && sub.getStatus() != SubscriptionStatus.EXPIRED) {
