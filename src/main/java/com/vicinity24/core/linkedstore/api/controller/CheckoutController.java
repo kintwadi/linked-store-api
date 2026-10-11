@@ -31,6 +31,7 @@ import com.vicinity24.core.linkedstore.api.repository.StoreUserRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionItemRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
 import com.vicinity24.core.linkedstore.api.service.CheckoutService;
+import com.vicinity24.core.linkedstore.api.service.PlatformContractService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -78,6 +79,7 @@ public class CheckoutController {
     private final QrTokenRepository qrTokenRepository;
     private final StoreUserRepository storeUserRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
+    private final PlatformContractService platformContractService;
 
     @PostMapping("/sessions")
     public ResponseEntity<CheckoutSessionResponse> createSession(
@@ -127,6 +129,25 @@ public class CheckoutController {
         final Store originatingStore = storeRepository.findById(tx.getOriginatingStoreId()).orElse(null);
         final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
         final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
+
+        if (!platformContractService.isConfigured()) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(CheckoutSessionResponse.builder()
+                    .status("error")
+                    .message("The platform contract is not configured yet. Please contact support.")
+                    .build());
+        }
+        if (!platformContractService.canStoreTransact(originatingStore)) {
+            return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(CheckoutSessionResponse.builder()
+                    .status("error")
+                    .message("The originating store does not have an active subscription.")
+                    .build());
+        }
+        if (!platformContractService.canStoreTransact(fulfillingStore)) {
+            return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(CheckoutSessionResponse.builder()
+                    .status("error")
+                    .message("The fulfilling store does not have an active subscription.")
+                    .build());
+        }
 
         final boolean storeNotOnboarded = fulfillingStore.getStripeConnectId() == null
                 || fulfillingStore.getStripeConnectId().isBlank()
@@ -258,9 +279,13 @@ public class CheckoutController {
             final Map<String, Object> paymentIntentData = new HashMap<>();
             paymentIntentData.put("transfer_data", transferData);
 
-            final long platformFeeCents = tx.getTotalRetailCents()
-                    - tx.getWholesalePayoutCents()
-                    - (tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0L);
+            final long platformFeeCents;
+            if (platformContractService.isFeeBased()) {
+                platformFeeCents = platformContractService.computePlatformFeeCents(
+                        tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0);
+            } else {
+                platformFeeCents = 0L;
+            }
             if (platformFeeCents > 0) {
                 paymentIntentData.put("application_fee_amount", platformFeeCents);
             }
@@ -439,6 +464,26 @@ public class CheckoutController {
                         .message("Store configuration missing for split ledger checkout.")
                         .build());
             }
+
+            if (!platformContractService.isConfigured()) {
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("The platform contract is not configured yet. Please contact support.")
+                        .build());
+            }
+            if (!platformContractService.canStoreTransact(originatingStore)) {
+                return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("The originating store does not have an active subscription.")
+                        .build());
+            }
+            if (!platformContractService.canStoreTransact(fulfillingStore)) {
+                return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("The fulfilling store does not have an active subscription.")
+                        .build());
+            }
+
             final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
             final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
@@ -583,7 +628,12 @@ public class CheckoutController {
 
             if (transfersCapable) {
                 try {
-                    final int platformFeeCents = Math.max(0, retailCents - wholesaleCents - marginCents);
+                    final int platformFeeCents;
+                    if (platformContractService.isFeeBased()) {
+                        platformFeeCents = platformContractService.computePlatformFeeCents(marginCents);
+                    } else {
+                        platformFeeCents = 0;
+                    }
                     final int transferCap = Math.max(0, retailCents - platformFeeCents);
                     final int realTransfer = Math.min(wholesaleCents, transferCap);
                     if (realTransfer <= 0 || wholesaleCents > retailCents) {

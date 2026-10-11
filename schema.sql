@@ -438,3 +438,22 @@ CREATE INDEX IF NOT EXISTS idx_qr_tokens_expiry          ON qr_tokens(expires_at
 --  15. store geolocation coverage index (used by store-search)
 -- =============================================================
 CREATE INDEX IF NOT EXISTS idx_stores_lat_lng ON stores(latitude, longitude);
+
+-- =============================================================
+--  16. platform_contract  (singleton row: id = 1)
+--      Stores the active platform revenue contract:
+--        mode = FEE_BASED | SUBSCRIPTION | NONE
+--        fee_percentage = % cut of the originating store's
+--                         arbitrage margin (FEE_BASED only)
+--        platform_payout_connect_id = Stripe Connect account
+--                         that receives platform service fees
+-- =============================================================
+CREATE TABLE IF NOT EXISTS platform_contract (
+    id BIGINT PRIMARY KEY,
+    mode VARCHAR(32) NOT NULL DEFAULT 'NONE'
+        CHECK (mode IN ('FEE_BASED','SUBSCRIPTION','NONE')),
+    fee_percentage DOUBLE PRECISION NOT NULL DEFAULT 0
+        CHECK (fee_percentage >= 0 AND fee_percentage <= 100),
+    platform_payout_connect_id VARCHAR(255),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

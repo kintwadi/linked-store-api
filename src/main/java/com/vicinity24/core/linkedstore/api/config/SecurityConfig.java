@@ -95,6 +95,8 @@ public class SecurityConfig {
                 .requestMatchers("/api/connect/**").hasAnyRole("GLOBAL_ADMIN", "OWNER", "STORE_ADMIN")
                 .requestMatchers("/api/fulfillment/**", "/api/inventory/**")
                     .hasAnyRole("GLOBAL_ADMIN", "OWNER", "STORE_ADMIN", "STORE_REPRESENTATIVE", "CLERK", "RUNNER")
+                .requestMatchers(HttpMethod.GET, "/api/platform-contract/public").permitAll()
+                .requestMatchers("/api/platform-contract/admin", "/api/platform-contract/admin/**").hasRole("GLOBAL_ADMIN")
                 .requestMatchers("/actuator/**").denyAll()
                 .anyRequest().permitAll()
             );

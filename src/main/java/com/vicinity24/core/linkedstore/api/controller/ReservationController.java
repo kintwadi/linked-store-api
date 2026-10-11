@@ -9,6 +9,7 @@ import com.vicinity24.core.linkedstore.api.dto.TxEventType;
 import com.vicinity24.core.linkedstore.api.entity.*;
 import com.vicinity24.core.linkedstore.api.exception.ResourceNotFoundException;
 import com.vicinity24.core.linkedstore.api.repository.*;
+import com.vicinity24.core.linkedstore.api.service.PlatformContractService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -47,6 +48,7 @@ public class ReservationController {
     private final QrTokenRepository qrTokenRepository;
     private final StripeConfig stripeConfig;
     private final TransactionEventBroadcaster eventBroadcaster;
+    private final PlatformContractService platformContractService;
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
@@ -123,6 +125,31 @@ public class ReservationController {
                     .status("unavailable")
                     .message("No participating store has this item in stock.")
                     .build());
+        }
+
+        if (!platformContractService.isConfigured()) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(ReservationResponse.builder()
+                            .accepted(false)
+                            .status("platform_not_configured")
+                            .message("The platform contract is not configured yet. Please contact support.")
+                            .build());
+        }
+        if (!platformContractService.canStoreTransact(originating)) {
+            return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED)
+                    .body(ReservationResponse.builder()
+                            .accepted(false)
+                            .status("originating_store_not_eligible")
+                            .message("The originating store does not have an active subscription.")
+                            .build());
+        }
+        if (!platformContractService.canStoreTransact(fulfilling)) {
+            return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED)
+                    .body(ReservationResponse.builder()
+                            .accepted(false)
+                            .status("fulfilling_store_not_eligible")
+                            .message("The fulfilling store does not have an active subscription.")
+                            .build());
         }
 
         final boolean crossStoreSplit = !originatingStoreId.equals(variant.getStoreId());
