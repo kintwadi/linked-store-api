@@ -24,7 +24,18 @@ Hyperlocal omnichannel retail network — shoppers browse, reserve, and check ou
 cd backend
 .\__run_with_env.bat spring-boot:run
 ```
-(The wrapper calls `setup.bat` first — which exports all `LINKEDSTORE_AUTH_*`, Stripe, DB, and R2 env vars literally — then invokes Maven.)
+(The wrapper calls `setup.bat` first — which exports all `LINKEDSTORE_AUTH_*`, Stripe, DB, R2, and **platform contract** env vars literally — then invokes Maven.)
+
+#### Platform contract env vars (in `setup.bat` / `render.env`)
+The platform runs under **one** of two mutually-exclusive revenue contracts. Set them in `setup.bat` (local) and `render.env` (production). Exactly one of the two must be `enabled`.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `FEE_BASED_CONTRACT` | `enabled` | Platform takes a % service fee on the originating store's arbitrage margin. No store subscription required; the Subscription tab is hidden in store dashboards. |
+| `FEE_BASED_CONTRACT_PERCENTAGE` | `10` | Percentage of the originating store's margin collected as platform fee (0–100). |
+| `SUBSCRIPTION_FEE_BASED_CONTRACT` | `disabled` | No platform fee collected. Every store must hold an active subscription (ACTIVE / TRIALING / PAST_DUE) to transact; the Subscription tab is shown in store dashboards. |
+
+> If both are enabled the backend falls back to **FEE_BASED** and logs an error. If both are disabled, all store transactions are blocked (`503`). The contract can also be changed at runtime from the **Contract** tab in the Global Admin dashboard (see §6.5).
 
 ### Start frontend
 ```powershell
@@ -64,6 +75,8 @@ The checkout page clearly shows the Host (originator margin) vs Neighbor (fulfil
 
 ![QR + 8-digit fallback side-by-side](artifacts/12_checkout_qr_and_8digit_code.png)
 
+> When the platform is in **FEE_BASED** contract mode, the order summary includes a **"Platform service fee (X%)"** line item. This fee is deducted from the originating (Host) store's arbitrage margin — it is **not** added to the customer's total. The customer still pays the full retail price; the platform takes its cut from the margin before the remaining margin is transferred to the Host store.
+
 ### Step 4. Pay (Stripe hosted checkout)
 Clicking **Pay** redirects you to a Stripe hosted checkout session:
 
@@ -73,7 +86,7 @@ After successful payment you return to a success page:
 
 ![Checkout success](artifacts/09_checkout_success_green.png)
 
-> Internally the split-ledger is applied: the **neighbor store's Stripe Connect** account receives the wholesale amount *declaratively* via `SessionCreateParams.destination`, and the **host store** receives their margin via a `Transfer.create` after pickup is verified (fallback safe-bytes pattern if capabilities are missing: amounts embedded in metadata and two explicit `Transfer.create` are issued post-pickup). Platform commission = 0 %.
+> Internally the split-ledger is applied: the **neighbor store's Stripe Connect** account receives the wholesale amount *declaratively* via `SessionCreateParams.destination`, and the **host store** receives their margin via a `Transfer.create` after pickup is verified (fallback safe-bytes pattern if capabilities are missing: amounts embedded in metadata and two explicit `Transfer.create` are issued post-pickup). In **FEE_BASED** contract mode the platform also takes a percentage service fee from the host store's margin before the remainder is transferred to the host. In **SUBSCRIPTION** mode no platform fee is collected.
 
 ### Step 5. Merchant pickup — QR (secure) or 8-digit code (fallback)
 The staff member at the fulfillment store opens the merchant pickup page. They can either **scan the shopper's QR code** (primary, cryptographically signed pickup token), or the shopper can read their **8-digit numeric code**:
@@ -95,6 +108,9 @@ Before a store can receive split-ledger payouts its owner must complete Stripe E
 
 ![Stripe Express onboarding](artifacts/02_stripe_express_onboarding.png)
 ![Onboarding list](artifacts/01_store_onboarding_list.png)
+
+### Platform payout account (FEE_BASED mode)
+When the platform runs in **FEE_BASED** contract mode, the service fee collected on each transaction must be paid out to the platform's own Stripe connected account. The **Global Admin** sets this account ID (`acct_...`) on the **Contract** tab of the admin dashboard. If left blank, the platform's default Stripe account receives the fee.
 
 ---
 
@@ -142,9 +158,19 @@ Enter credentials. After successful login:
 
 ---
 
-## 6. Admin Dashboard — Three Tabs
+## 6. Admin Dashboard — Tabs
 
-The `/admin` page exposes three tabs: **Stores**, **Users**, **Transactions**. What you see depends on your role.
+The `/admin` page exposes the following tabs. What you see depends on your role:
+
+| Tab | Visible to |
+|---|---|
+| Stores | all roles (store admins see only their store) |
+| Users | GLOBAL_ADMIN (all), STORE_ADMIN/OWNER (their store) |
+| Transactions | GLOBAL_ADMIN (all), STORE_ADMIN/OWNER (their store) |
+| Returns | GLOBAL_ADMIN, STORE_ADMIN/OWNER |
+| Subscription | GLOBAL_ADMIN (all stores), STORE_ADMIN/OWNER (their store) — **hidden when contract mode is FEE_BASED** |
+| Plans | GLOBAL_ADMIN only |
+| Contract | **GLOBAL_ADMIN only** |
 
 ### 6.1 Stores tab
 
@@ -191,6 +217,29 @@ Pagination controls at the bottom: **Prev / Next**. An empty starting state for 
 ![Transactions tab + pagination](artifacts/19_admin_transactions_tab_empty_pagination.png)
 
 Columns shown in the table: **ID, Stores (Host ⇄ Neighbor), Status, Total, Created**. Rows are color-coded by status: green = completed/paid/settled, amber = pending/processing/hold, red = failed/cancelled/refund, blue = anything else.
+
+### 6.4 Subscription tab
+Visible only when the platform contract mode is **SUBSCRIPTION**. In **FEE_BASED** mode this tab is hidden for everyone, because stores do not need a subscription to transact. See §6.5 for how to switch contract modes.
+
+### 6.5 Contract tab — GLOBAL_ADMIN only
+
+This tab controls the platform's revenue contract. **Only Global Admins** can see or change it. Store admins never have access to this tab.
+
+**Three mutually-exclusive modes** (select exactly one):
+
+| Mode | What it means |
+|---|---|
+| **Fee-based** | Platform takes a % service fee on the originating store's arbitrage margin. No store subscription needed. The Subscription tab is hidden in store dashboards. The service fee is shown on the checkout page. |
+| **Subscription-based** | No platform fee collected. Every store must have an active subscription (ACTIVE / TRIALING / PAST_DUE) to originate or fulfill transactions. The Subscription tab is shown in store dashboards. |
+| **Disabled (none)** | Neither fee nor subscription is configured. **All store transactions are blocked** until a mode is selected. |
+
+**Fields** (visible depending on mode):
+- **Service fee percentage** (0–100): the % of the originating store's margin collected as platform fee. Only used in Fee-based mode.
+- **Platform payout Stripe Connect ID** (`acct_...`): the connected account that receives platform service-fee payouts. Only used in Fee-based mode. Leave blank to use the platform's default Stripe account.
+
+> The two modes are enforced as mutually exclusive both at boot (env vars) and at runtime (this form). If both env vars are set to `enabled`, the backend falls back to **Fee-based** and logs an error.
+
+Click **Save contract** to persist. The change takes effect immediately — any new reservation or checkout is gated by the new mode.
 
 ---
 
@@ -346,6 +395,18 @@ Requires at least `STORE_ADMIN` for the target store (or GLOBAL_ADMIN). `{storeI
 | POST | `/pending-variant` multipart/form-data (`file`, `store_id`) | Pending scope for Add-variant form — `stores/{id}/uploads/pending/variants/yyyy/MM/dd/…` |
 | DELETE | `/delete` (JSON: `{ objectKey }`) | Hard-delete from R2 bucket |
 
+### Platform Contract — `/api/platform-contract/**`
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/public` | public | Returns `{ mode, feePercentage, isConfigured }`. Used by the checkout page and store dashboards to decide UI (e.g. show service fee, hide subscription tab). |
+| GET | `/admin` | **GLOBAL_ADMIN only** | Returns the full contract including `platformPayoutConnectId` and `updatedAt`. |
+| PUT | `/admin` | **GLOBAL_ADMIN only** | Updates the contract. Body: `{ mode: "FEE_BASED" \| "SUBSCRIPTION" \| "NONE", feePercentage: number, platformPayoutConnectId: string \| null }`. Mode is inherently single-select so mutual exclusion is guaranteed. |
+
+> Both the originating (Host) and fulfilling (Neighbor) stores must pass the contract gate before any reservation or checkout can proceed:
+> - **FEE_BASED** → both stores always eligible (no subscription needed).
+> - **SUBSCRIPTION** → both stores must have `subscriptionStatus` ACTIVE / TRIALING / PAST_DUE (or an active subscription record). Otherwise HTTP **402** is returned.
+> - **NONE** → all transactions blocked with HTTP **503**.
+
 Plus the prior e-commerce controllers: reservations, checkout, pickup verify, Stripe sessions/pay, Connect onboarding, inventory availability (see prior phases).
 
 ---
@@ -364,6 +425,10 @@ Plus the prior e-commerce controllers: reservations, checkout, pickup verify, St
 | Build warnings `Module 'qrcode' is not ESM` | Harmless — angularx-qrcode pulls CommonJS. Build still produces valid bundles. |
 | **"Network error during upload."** when adding product cover/gallery | 99 % = backend not running on port 8080. Start backend with `cd backend; .\__run_with_env.bat`; message ends with `· Check backend is running (origin)`. Also check CORS preflight: OPTIONS to `/api/images/upload` with `Origin=4200` must return 200 + `Access-Control-Allow-Credentials: true`. |
 | **"A database constraint was violated. Please check your input."** when saving a product (after fixes, message now ends with `Constraint: …`) | (a) If you see **Constraint: uk_product_variants_store_sku** → you typed a SKU that already exists in this store — change it or leave blank (auto-assigns a unique fallback). (b) If the constraint name is **chk_positive_stock** → Stock quantity cannot be negative. (c) If you still see "constraint was violated" WITHOUT a constraint name → your build predates the GlobalExceptionHandler extractor; upgrade backend. For legacy DBs with old schema drift: Hibernate `ddl-auto=update` never drops old constraints/columns; fix once via psql: `ALTER TABLE product_variants DROP CONSTRAINT IF EXISTS ukq935p2d1pbjm39n0063ghnfgn; ALTER TABLE product_variants ALTER COLUMN sku DROP NOT NULL;` — then restart backend. |
+| Reservation / checkout returns **503 Service Unavailable** | The platform has no active revenue contract. Log in as GLOBAL_ADMIN → **Contract** tab → select **Fee-based** or **Subscription-based** → Save. (Env vars `FEE_BASED_CONTRACT` / `SUBSCRIPTION_FEE_BASED_CONTRACT` are both `disabled`.) |
+| Reservation / checkout returns **402 Payment Required** for a store | In **SUBSCRIPTION** contract mode the store must have an active subscription. Either (a) have the store owner subscribe from their dashboard Subscription tab, or (b) switch the platform to **Fee-based** mode (no subscription required). |
+| Store dashboard **Subscription tab is missing** | Expected when the platform contract is **Fee-based**. In Fee-based mode stores do not need a subscription, so the tab is hidden. Switch to **Subscription-based** in the GLOBAL_ADMIN Contract tab to make it reappear. |
+| Both `FEE_BASED_CONTRACT` and `SUBSCRIPTION_FEE_BASED_CONTRACT` are `enabled` in env | The backend falls back to **FEE_BASED** and logs an error. Fix: set exactly one to `enabled` and the other to `disabled` in `setup.bat` / `render.env`. |
 
 ---
 
@@ -380,6 +445,8 @@ Plus the prior e-commerce controllers: reservations, checkout, pickup verify, St
 | `/api/admin/stores/{id}/inventory/**` product CRUD + gallery | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `/api/admin/stores/{id}/transactions` store-scoped tx | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `/api/images/**` upload cover/gallery/logo/pending | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `/api/platform-contract/public` GET | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `/api/platform-contract/admin` GET / PUT | ✅ only | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `/api/fulfillment/**` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `/api/inventory/**` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Reserve / checkout / pay / pickup verify flows | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |

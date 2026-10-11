@@ -78,6 +78,16 @@ stripe:
     plus-price-id: ${SUBSCRIPTION_PLUS_STRIPE_PRICE_ID:}
     pro-price-id: ${SUBSCRIPTION_PRO_STRIPE_PRICE_ID:}
 
+fee:
+  based:
+    contract: ${FEE_BASED_CONTRACT:disabled}
+    percentage: ${FEE_BASED_CONTRACT_PERCENTAGE:10}
+
+subscription:
+  fee:
+    based:
+      contract: ${SUBSCRIPTION_FEE_BASED_CONTRACT:disabled}
+
 cloudflare:
   r2:
     account-id: ${R2_ACCOUNT_ID:}
