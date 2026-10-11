@@ -328,6 +328,14 @@ public class ConnectController {
             @RequestHeader("Stripe-Signature") String stripeSignature) {
 
         ensureStripeKey();
+
+        final String eventType = peekEventType(rawPayload);
+        final boolean isV2 = eventType != null && eventType.startsWith("v2.");
+
+        if (isV2) {
+            return handleV2Webhook(rawPayload, stripeSignature, eventType);
+        }
+
         final Event event;
         try {
             if (connectWebhookSecret == null || connectWebhookSecret.isBlank()) {
@@ -359,22 +367,6 @@ public class ConnectController {
             case "account.external_account.created":
                 handleAccountUpdated(event);
                 break;
-            case "v2.core.account.created":
-            case "v2.core.account.updated":
-            case "v2.core.account.closed":
-            case "v2.core.account[configuration.recipient].updated":
-            case "v2.core.account[configuration.customer].updated":
-            case "v2.core.account[configuration.merchant].updated":
-            case "v2.core.account[configuration.recipient.capability_status].updated":
-            case "v2.core.account[configuration.customer.capability_status].updated":
-            case "v2.core.account[configuration.merchant.capability_status].updated":
-            case "v2.core.account[configuration.requirements].updated":
-            case "v2.core.account[configuration.identity].updated":
-            case "v2.core.account[configuration.future_requirements].updated":
-            case "v2.core.account[configuration.defaults].updated":
-            case "v2.core.account_link.returned":
-                handleV2AccountEvent(event);
-                break;
             case "checkout.session.completed":
                 handleCheckoutSessionCompleted(event);
                 break;
@@ -404,6 +396,66 @@ public class ConnectController {
         body.put("status", "ok");
         body.put("handled_event", type);
         return ResponseEntity.ok(body);
+    }
+
+    private ResponseEntity<Map<String, Object>> handleV2Webhook(
+            String rawPayload, String stripeSignature, String eventType) {
+
+        try {
+            final com.stripe.model.v2.core.EventNotification[] notificationHolder =
+                    new com.stripe.model.v2.core.EventNotification[1];
+
+            final com.stripe.EventNotificationFallbackCallback fallback =
+                    (notification, client, details) -> notificationHolder[0] = notification;
+
+            final com.stripe.StripeClient client = new com.stripe.StripeClient(stripeConfig.getStripeApiKey());
+
+            if (connectWebhookSecret == null || connectWebhookSecret.isBlank()) {
+                log.warn("Connect: STRIPE_WEBHOOK_SECRET is not set; skipping v2 signature verification.");
+                final com.stripe.StripeEventNotificationHandlerWithoutVerification handler =
+                        com.stripe.StripeEventNotificationHandler.withoutVerification(client, fallback);
+                handler.handle(rawPayload);
+            } else {
+                final com.stripe.StripeEventNotificationHandler handler =
+                        new com.stripe.StripeEventNotificationHandler(connectWebhookSecret, client, fallback);
+                handler.handle(rawPayload, stripeSignature);
+            }
+
+            final com.stripe.model.v2.core.EventNotification notification = notificationHolder[0];
+            if (notification == null) {
+                log.info("Connect: v2 event {} not captured by fallback (maybe registered type).", eventType);
+            } else if (eventType.startsWith("v2.core.account")) {
+                handleV2AccountEvent(notification);
+            } else {
+                log.info("Connect: ignoring unhandled v2 webhook event {}", eventType);
+            }
+        } catch (com.stripe.exception.SignatureVerificationException ex) {
+            log.warn("Connect: v2 webhook signature failed verification: {}", ex.getMessage());
+            final Map<String, Object> body = new HashMap<>();
+            body.put("status", "signature_invalid");
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+        } catch (Exception ex) {
+            log.warn("Connect: v2 webhook could not be parsed. Acknowledging with 200. Details: {}", ex.getMessage());
+            final Map<String, Object> body = new HashMap<>();
+            body.put("status", "acknowledged_unparsed");
+            return ResponseEntity.ok(body);
+        }
+
+        final Map<String, Object> body = new HashMap<>();
+        body.put("status", "ok");
+        body.put("handled_event", eventType);
+        return ResponseEntity.ok(body);
+    }
+
+    private static String peekEventType(String rawPayload) {
+        try {
+            final com.google.gson.JsonObject json = new Gson().fromJson(rawPayload, com.google.gson.JsonObject.class);
+            if (json != null && json.has("type") && json.get("type").isJsonPrimitive()) {
+                return json.get("type").getAsString();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private void handleAccountUpdated(Event event) {
@@ -440,6 +492,65 @@ public class ConnectController {
         }
     }
 
+    private void handleV2AccountEvent(com.stripe.model.v2.core.EventNotification notification) {
+        try {
+            final String accountId = extractAccountIdFromNotification(notification);
+            if (accountId == null) {
+                log.warn("Connect: v2 account event {} has no account id", notification.getType());
+                return;
+            }
+            final Account account = Account.retrieve(accountId);
+            if (account == null) {
+                log.warn("Connect: v2 account event {} could not retrieve account {}", notification.getType(), accountId);
+                return;
+            }
+            syncStoreFromAccount(account, notification.getType());
+        } catch (Exception ex) {
+            log.error("Connect: handleV2AccountEvent failed for event {}", notification.getId(), ex);
+        }
+    }
+
+    private static String extractAccountIdFromNotification(com.stripe.model.v2.core.EventNotification notification) {
+        try {
+            if (notification instanceof com.stripe.events.UnknownEventNotification unknown) {
+                final com.stripe.model.v2.core.Event.RelatedObject related = unknown.getRelatedObject();
+                if (related != null && related.getId() != null) {
+                    return related.getId();
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private void syncStoreFromAccount(Account account, String eventType) {
+        final String storedStoreId = account.getMetadata() != null ? account.getMetadata().get("storeId") : null;
+        if (storedStoreId == null) {
+            final Optional<Store> byConnect = storeRepository.findByStripeConnectId(account.getId());
+            if (byConnect.isPresent()) {
+                final Store s = byConnect.get();
+                log.info("Connect: {} storeId={} (matched by connectId {}): charges={} payouts={}",
+                        eventType, s.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
+            } else {
+                log.warn("Connect: {} for account {} but cannot find storeId (no metadata/store mapping)", eventType, account.getId());
+            }
+            return;
+        }
+        final UUID uuid;
+        try { uuid = UUID.fromString(storedStoreId); }
+        catch (IllegalArgumentException iae) { log.warn("Connect: invalid storeId in account metadata {}", storedStoreId); return; }
+        storeRepository.findById(uuid).ifPresent(store -> {
+            boolean changed = false;
+            if (!account.getId().equals(store.getStripeConnectId())) {
+                store.setStripeConnectId(account.getId());
+                changed = true;
+            }
+            if (changed) storeRepository.save(store);
+            log.info("Connect: {} for store {} (connectId={}): chargesEnabled={} payoutsEnabled={}",
+                    eventType, store.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
+        });
+    }
+
     private void handleV2AccountEvent(Event event) {
         try {
             final String accountId = extractAccountIdFromEvent(event);
@@ -452,31 +563,7 @@ public class ConnectController {
                 log.warn("Connect: v2 account event {} could not retrieve account {}", event.getType(), accountId);
                 return;
             }
-            final String storedStoreId = account.getMetadata() != null ? account.getMetadata().get("storeId") : null;
-            if (storedStoreId == null) {
-                final Optional<Store> byConnect = storeRepository.findByStripeConnectId(account.getId());
-                if (byConnect.isPresent()) {
-                    final Store s = byConnect.get();
-                    log.info("Connect: v2 {} storeId={} (matched by connectId {}): charges={} payouts={}",
-                            event.getType(), s.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
-                } else {
-                    log.warn("Connect: v2 {} for account {} but cannot find storeId (no metadata/store mapping)", event.getType(), account.getId());
-                }
-                return;
-            }
-            final UUID uuid;
-            try { uuid = UUID.fromString(storedStoreId); }
-            catch (IllegalArgumentException iae) { log.warn("Connect: invalid storeId in account metadata {}", storedStoreId); return; }
-            storeRepository.findById(uuid).ifPresent(store -> {
-                boolean changed = false;
-                if (!account.getId().equals(store.getStripeConnectId())) {
-                    store.setStripeConnectId(account.getId());
-                    changed = true;
-                }
-                if (changed) storeRepository.save(store);
-                log.info("Connect: v2 {} for store {} (connectId={}): chargesEnabled={} payoutsEnabled={}",
-                        event.getType(), store.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
-            });
+            syncStoreFromAccount(account, event.getType());
         } catch (Exception ex) {
             log.error("Connect: handleV2AccountEvent failed for event {}", event.getId(), ex);
         }
