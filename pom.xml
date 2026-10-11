@@ -20,7 +20,7 @@
     <properties>
         <java.version>17</java.version>
         <maven.compiler.release>17</maven.compiler.release>
-        <stripe.version>25.12.0</stripe.version>
+        <stripe.version>33.4.2</stripe.version>
         <hibernate-types.version>3.7.4</hibernate-types.version>
         <lombok.version>1.18.40</lombok.version>
         <awssdk.version>2.26.27</awssdk.version>

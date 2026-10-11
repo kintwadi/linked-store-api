@@ -343,10 +343,11 @@ public class ConnectController {
             body.put("status", "signature_invalid");
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
         } catch (Exception ex) {
-            log.error("Connect: webhook parse error", ex);
+            log.warn("Connect: webhook could not be parsed (likely a v2 event or new schema). " +
+                    "Acknowledging with 200 so Stripe stops retrying. Details: {}", ex.getMessage());
             final Map<String, Object> body = new HashMap<>();
-            body.put("status", "parse_error");
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+            body.put("status", "acknowledged_unparsed");
+            return ResponseEntity.ok(body);
         }
 
         final String type = event.getType();
@@ -357,6 +358,22 @@ public class ConnectController {
             case "account.external_account.updated":
             case "account.external_account.created":
                 handleAccountUpdated(event);
+                break;
+            case "v2.core.account.created":
+            case "v2.core.account.updated":
+            case "v2.core.account.closed":
+            case "v2.core.account[configuration.recipient].updated":
+            case "v2.core.account[configuration.customer].updated":
+            case "v2.core.account[configuration.merchant].updated":
+            case "v2.core.account[configuration.recipient.capability_status].updated":
+            case "v2.core.account[configuration.customer.capability_status].updated":
+            case "v2.core.account[configuration.merchant.capability_status].updated":
+            case "v2.core.account[configuration.requirements].updated":
+            case "v2.core.account[configuration.identity].updated":
+            case "v2.core.account[configuration.future_requirements].updated":
+            case "v2.core.account[configuration.defaults].updated":
+            case "v2.core.account_link.returned":
+                handleV2AccountEvent(event);
                 break;
             case "checkout.session.completed":
                 handleCheckoutSessionCompleted(event);
@@ -421,6 +438,63 @@ public class ConnectController {
         } catch (Exception ex) {
             log.error("Connect: handleAccountUpdated failed for event {}", event.getId(), ex);
         }
+    }
+
+    private void handleV2AccountEvent(Event event) {
+        try {
+            final String accountId = extractAccountIdFromEvent(event);
+            if (accountId == null) {
+                log.warn("Connect: v2 account event {} has no account id", event.getType());
+                return;
+            }
+            final Account account = Account.retrieve(accountId);
+            if (account == null) {
+                log.warn("Connect: v2 account event {} could not retrieve account {}", event.getType(), accountId);
+                return;
+            }
+            final String storedStoreId = account.getMetadata() != null ? account.getMetadata().get("storeId") : null;
+            if (storedStoreId == null) {
+                final Optional<Store> byConnect = storeRepository.findByStripeConnectId(account.getId());
+                if (byConnect.isPresent()) {
+                    final Store s = byConnect.get();
+                    log.info("Connect: v2 {} storeId={} (matched by connectId {}): charges={} payouts={}",
+                            event.getType(), s.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
+                } else {
+                    log.warn("Connect: v2 {} for account {} but cannot find storeId (no metadata/store mapping)", event.getType(), account.getId());
+                }
+                return;
+            }
+            final UUID uuid;
+            try { uuid = UUID.fromString(storedStoreId); }
+            catch (IllegalArgumentException iae) { log.warn("Connect: invalid storeId in account metadata {}", storedStoreId); return; }
+            storeRepository.findById(uuid).ifPresent(store -> {
+                boolean changed = false;
+                if (!account.getId().equals(store.getStripeConnectId())) {
+                    store.setStripeConnectId(account.getId());
+                    changed = true;
+                }
+                if (changed) storeRepository.save(store);
+                log.info("Connect: v2 {} for store {} (connectId={}): chargesEnabled={} payoutsEnabled={}",
+                        event.getType(), store.getId(), account.getId(), account.getChargesEnabled(), account.getPayoutsEnabled());
+            });
+        } catch (Exception ex) {
+            log.error("Connect: handleV2AccountEvent failed for event {}", event.getId(), ex);
+        }
+    }
+
+    private String extractAccountIdFromEvent(Event event) {
+        try {
+            final Object dataObject = event.getDataObjectDeserializer().getObject().orElse(null);
+            if (dataObject instanceof Account account) {
+                return account.getId();
+            }
+            final com.google.gson.JsonObject raw = event.getDataObjectDeserializer().getRawJsonObject();
+            if (raw != null && raw.has("id") && raw.get("id").isJsonPrimitive()) {
+                return raw.get("id").getAsString();
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private void handleCheckoutSessionCompleted(Event event) {
