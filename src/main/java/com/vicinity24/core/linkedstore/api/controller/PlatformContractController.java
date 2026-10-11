@@ -88,14 +88,32 @@ public class PlatformContractController {
         boolean isNewAccount = false;
 
         try {
-            if (stripeConnectId == null || stripeConnectId.isBlank()
-                    || stripeConnectId.startsWith("acct_connected_")) {
-                ConnectOnboardingRequest resolver = ConnectOnboardingRequest.builder()
-                        .country(request != null ? request.getCountry() : null)
-                        .defaultCurrency(request != null ? request.getDefaultCurrency() : null)
-                        .build();
-                String country = resolver.resolvedCountry();
-                String currency = resolver.resolvedDefaultCurrency();
+            ConnectOnboardingRequest resolver = ConnectOnboardingRequest.builder()
+                    .country(request != null ? request.getCountry() : null)
+                    .defaultCurrency(request != null ? request.getDefaultCurrency() : null)
+                    .build();
+            String country = resolver.resolvedCountry();
+            String currency = resolver.resolvedDefaultCurrency();
+
+            boolean needsNewAccount = stripeConnectId == null || stripeConnectId.isBlank()
+                    || stripeConnectId.startsWith("acct_connected_");
+
+            if (!needsNewAccount) {
+                try {
+                    Account existing = Account.retrieve(stripeConnectId);
+                    String existingCountry = existing.getCountry();
+                    if (existingCountry == null || !existingCountry.equalsIgnoreCase(country)) {
+                        needsNewAccount = true;
+                        log.info("Platform contract: existing account {} country {} differs from selected {}; creating new account",
+                                stripeConnectId, existingCountry, country);
+                    }
+                } catch (StripeException ex) {
+                    needsNewAccount = true;
+                    log.warn("Platform contract: could not retrieve existing account {}; creating new one", stripeConnectId);
+                }
+            }
+
+            if (needsNewAccount) {
                 AccountCreateParams.Builder b = AccountCreateParams.builder()
                         .setType(AccountCreateParams.Type.EXPRESS)
                         .setCountry(country)
