@@ -7,6 +7,7 @@ import com.stripe.param.AccountCreateParams;
 import com.stripe.param.AccountLinkCreateParams;
 import com.stripe.param.AccountUpdateParams;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
+import com.vicinity24.core.linkedstore.api.dto.ConnectOnboardingRequest;
 import com.vicinity24.core.linkedstore.api.dto.ResolvedLink;
 import com.vicinity24.core.linkedstore.api.dto.StripeErrorInfo;
 import com.vicinity24.core.linkedstore.api.entity.PlatformContract;
@@ -79,7 +80,8 @@ public class PlatformContractController {
     }
 
     @PostMapping("/admin/platform-onboarding")
-    public ResponseEntity<Map<String, Object>> createPlatformOnboardingLink() {
+    public ResponseEntity<Map<String, Object>> createPlatformOnboardingLink(
+            @RequestBody PlatformOnboardingRequest request) {
         ensureStripeKey();
         PlatformContract contract = contractService.getEffectiveContract();
         String stripeConnectId = contract.getPlatformPayoutConnectId();
@@ -88,13 +90,21 @@ public class PlatformContractController {
         try {
             if (stripeConnectId == null || stripeConnectId.isBlank()
                     || stripeConnectId.startsWith("acct_connected_")) {
+                ConnectOnboardingRequest resolver = ConnectOnboardingRequest.builder()
+                        .country(request != null ? request.getCountry() : null)
+                        .defaultCurrency(request != null ? request.getDefaultCurrency() : null)
+                        .build();
+                String country = resolver.resolvedCountry();
+                String currency = resolver.resolvedDefaultCurrency();
                 AccountCreateParams.Builder b = AccountCreateParams.builder()
                         .setType(AccountCreateParams.Type.EXPRESS)
-                        .setCountry("US")
-                        .setDefaultCurrency("usd")
+                        .setCountry(country)
+                        .setDefaultCurrency(currency.toLowerCase(Locale.ROOT))
                         .setEmail("platform@vicinity24.dev")
                         .setBusinessType(AccountCreateParams.BusinessType.COMPANY)
                         .putMetadata("purpose", "platform_payout_account")
+                        .putMetadata("country", country)
+                        .putMetadata("defaultCurrency", currency)
                         .setCapabilities(
                                 AccountCreateParams.Capabilities.builder()
                                         .setTransfers(AccountCreateParams.Capabilities.Transfers.builder()
@@ -111,7 +121,8 @@ public class PlatformContractController {
                         contract.getFeePercentage(),
                         stripeConnectId);
                 isNewAccount = true;
-                log.info("Platform contract: created new platform Stripe Connect account {}", stripeConnectId);
+                log.info("Platform contract: created new platform Stripe Connect account {} (country={}, currency={})",
+                        stripeConnectId, country, currency);
             }
 
             try {
@@ -197,5 +208,13 @@ public class PlatformContractController {
         private String mode;
         private Double feePercentage;
         private String platformPayoutConnectId;
+    }
+
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class PlatformOnboardingRequest {
+        private String country;
+        private String defaultCurrency;
     }
 }
