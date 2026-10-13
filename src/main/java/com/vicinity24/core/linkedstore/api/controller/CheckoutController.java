@@ -304,9 +304,6 @@ public class CheckoutController {
                 transferData.put("amount", realTransfer);
                 final Map<String, Object> paymentIntentData = new HashMap<>();
                 paymentIntentData.put("transfer_data", transferData);
-                if (platformFeeCents > 0) {
-                    paymentIntentData.put("application_fee_amount", platformFeeCents);
-                }
                 params.put("payment_intent_data", paymentIntentData);
             } else {
                 log.warn("Split-ledger checkout tx={}: wholesale {} > retail {} or transfer cap {}; " +
@@ -414,8 +411,7 @@ public class CheckoutController {
             log.error("Unexpected error creating split-ledger checkout session for tx={}", request.getTransactionId(), ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(CheckoutSessionResponse.builder()
                     .status("error")
-                    .message("Could not open payment page. Please try again. Details: "
-                            + ex.getClass().getSimpleName() + ": " + ex.getMessage())
+                    .message("Could not open payment page. Please try again.")
                     .build());
         }
     }
@@ -672,9 +668,6 @@ public class CheckoutController {
                     transferData.put("amount", realTransfer);
                     final Map<String, Object> paymentIntentData = new HashMap<>();
                     paymentIntentData.put("transfer_data", transferData);
-                    if (platformFeeCents > 0) {
-                        paymentIntentData.put("application_fee_amount", platformFeeCents);
-                    }
                     params.put("payment_intent_data", paymentIntentData);
                     params.put("metadata", metadata);
                     assertSingleLineItemOnly(params);
@@ -728,8 +721,7 @@ public class CheckoutController {
             log.error("Unexpected error creating checkout session for productId={}", request.getProductId(), ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(CheckoutSessionResponse.builder()
                     .status("error")
-                    .message("Could not open payment page. Please try again. Details: "
-                            + ex.getClass().getSimpleName() + ": " + ex.getMessage())
+                    .message("Could not open payment page. Please try again.")
                     .build());
         }
     }
