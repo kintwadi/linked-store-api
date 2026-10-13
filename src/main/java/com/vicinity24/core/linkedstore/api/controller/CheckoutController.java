@@ -469,6 +469,13 @@ public class CheckoutController {
                     ? UUID.fromString(request.getOriginatingStoreId())
                     : variant.getStoreId();
 
+            if (originatingStoreId.equals(fulfillingStoreId)) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(CheckoutSessionResponse.builder()
+                        .status("error")
+                        .message("Self-store checkout is not allowed. Select a different store to complete the purchase.")
+                        .build());
+            }
+
             final int retailCents = Math.max(1, variant.getRetailPriceCents() != null
                     ? variant.getRetailPriceCents()
                     : Math.max(1, request.getAmountCents() == null ? 100 : request.getAmountCents().intValue()));
