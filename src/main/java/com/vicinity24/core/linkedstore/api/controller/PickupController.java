@@ -20,6 +20,7 @@ import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.service.PlatformContractService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -49,6 +50,7 @@ public class PickupController {
     private final InventoryLockRepository inventoryLockRepository;
     private final ProductVariantRepository productVariantRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
+    private final PlatformContractService platformContractService;
 
     private static String resolveStoreCurrencyLower(Store store) {
         if (store == null) return "usd";
@@ -179,17 +181,20 @@ public class PickupController {
         final Optional<Store> originatingOpt = storeRepository.findById(tx.getOriginatingStoreId());
         final Store originating = originatingOpt.orElse(null);
         final Integer marginCents = tx.getArbitrageMarginCents();
+        final int platformFeeCents = platformContractService.isFeeBased()
+                ? platformContractService.computePlatformFeeCents(marginCents != null ? marginCents : 0)
+                : 0;
+        final int payoutToOriginatingCents = Math.max(0, (marginCents != null ? marginCents : 0) - platformFeeCents);
 
         if (originating != null
                 && originating.getStripeConnectId() != null
                 && !originating.getStripeConnectId().isBlank()
                 && !originating.getStripeConnectId().startsWith("acct_connected_")
-                && marginCents != null
-                && marginCents > 0) {
+                && payoutToOriginatingCents > 0) {
 
             try {
                 final TransferCreateParams params = TransferCreateParams.builder()
-                        .setAmount(Long.valueOf(marginCents))
+                        .setAmount(Long.valueOf(payoutToOriginatingCents))
                         .setCurrency(txCurrencyLower)
                         .setDestination(originating.getStripeConnectId())
                         .setTransferGroup("tx_" + tx.getId())
