@@ -1038,7 +1038,7 @@ public class AdminStoreController {
     private ResponseEntity<?> doMarkReady(UUID txId, UUID storeId) {
         Transaction tx = transactionRepository.findById(txId).orElse(null);
         if (tx == null) return ResponseEntity.notFound().build();
-        if (!tx.getFulfillingStoreId().equals(storeId) && !tx.getOriginatingStoreId().equals(storeId)
+        if (!tx.getFulfillingStoreId().equals(storeId)
                 && !authenticationFacade.current().isGlobalAdmin()) {
             return ResponseEntity.status(403).build();
         }
@@ -1083,7 +1083,7 @@ public class AdminStoreController {
     private ResponseEntity<?> doMarkUnavailable(UUID txId, UUID storeId, String message) {
         Transaction tx = transactionRepository.findById(txId).orElse(null);
         if (tx == null) return ResponseEntity.notFound().build();
-        if (!tx.getFulfillingStoreId().equals(storeId) && !tx.getOriginatingStoreId().equals(storeId)
+        if (!tx.getFulfillingStoreId().equals(storeId)
                 && !authenticationFacade.current().isGlobalAdmin()) {
             return ResponseEntity.status(403).build();
         }
