@@ -1252,7 +1252,19 @@ public class AdminStoreController {
 
     // ---------- inventory helpers ----------
 
+    private void validateVariantPricing(Integer retailPriceCents, Integer wholesalePriceCents) {
+        if (retailPriceCents == null || wholesalePriceCents == null) {
+            return;
+        }
+        if (wholesalePriceCents > retailPriceCents) {
+            throw new IllegalArgumentException(
+                    "Wholesale price (" + wholesalePriceCents + " cents) cannot exceed retail price ("
+                            + retailPriceCents + " cents). The wholesale price must be less than or equal to the retail price.");
+        }
+    }
+
     private ProductVariant createInventoryListing(UUID storeId, StoreInventoryListingRequest request) {
+        validateVariantPricing(request.getRetailPriceCents(), request.getWholesalePriceCents());
         Product product;
         if (request.getProductId() != null) {
             product = productRepository.findById(request.getProductId())
@@ -1356,6 +1368,12 @@ public class AdminStoreController {
     }
 
     private void applyVariantUpdate(ProductVariant variant, StoreInventoryListingRequest request) {
+        final Integer effectiveRetail = request.getRetailPriceCents() != null
+                ? request.getRetailPriceCents() : variant.getRetailPriceCents();
+        final Integer effectiveWholesale = request.getWholesalePriceCents() != null
+                ? request.getWholesalePriceCents() : variant.getWholesalePriceCents();
+        validateVariantPricing(effectiveRetail, effectiveWholesale);
+
         if (request.getSku() != null) {
             String s = request.getSku().isBlank() ? null : request.getSku();
             variant.setSku(s);
