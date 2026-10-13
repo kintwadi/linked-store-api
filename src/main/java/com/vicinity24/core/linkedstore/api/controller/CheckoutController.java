@@ -414,7 +414,8 @@ public class CheckoutController {
             log.error("Unexpected error creating split-ledger checkout session for tx={}", request.getTransactionId(), ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(CheckoutSessionResponse.builder()
                     .status("error")
-                    .message("Could not open payment page. Please try again.")
+                    .message("Could not open payment page. Please try again. Details: "
+                            + ex.getClass().getSimpleName() + ": " + ex.getMessage())
                     .build());
         }
     }
@@ -720,7 +721,8 @@ public class CheckoutController {
             log.error("Unexpected error creating checkout session for productId={}", request.getProductId(), ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(CheckoutSessionResponse.builder()
                     .status("error")
-                    .message("Could not open payment page. Please try again.")
+                    .message("Could not open payment page. Please try again. Details: "
+                            + ex.getClass().getSimpleName() + ": " + ex.getMessage())
                     .build());
         }
     }
