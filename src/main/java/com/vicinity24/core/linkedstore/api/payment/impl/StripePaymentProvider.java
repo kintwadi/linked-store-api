@@ -106,6 +106,9 @@ public class StripePaymentProvider implements PaymentProvider {
             if (request.getTransferGroup() != null && !request.getTransferGroup().isBlank()) {
                 params.setTransferGroup(request.getTransferGroup());
             }
+            if (request.getSourceTransaction() != null && !request.getSourceTransaction().isBlank()) {
+                params.setSourceTransaction(request.getSourceTransaction());
+            }
             if (request.getRoute() != null && !request.getRoute().isBlank()) {
                 params.putMetadata("route", request.getRoute());
             }

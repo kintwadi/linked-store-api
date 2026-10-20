@@ -1,10 +1,5 @@
 package com.vicinity24.core.linkedstore.api.controller;
 
-import com.stripe.Stripe;
-import com.stripe.exception.StripeException;
-import com.stripe.model.Transfer;
-import com.stripe.param.TransferCreateParams;
-import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.PickupVerifyRequest;
 import com.vicinity24.core.linkedstore.api.dto.PickupVerifyResponse;
 import com.vicinity24.core.linkedstore.api.dto.TxEvent;
@@ -20,9 +15,8 @@ import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
-import com.vicinity24.core.linkedstore.api.service.PlatformContractService;
+import com.vicinity24.core.linkedstore.api.service.CheckoutService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
-import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
@@ -43,14 +37,13 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class PickupController {
 
-    private final StripeConfig stripeConfig;
     private final QrTokenRepository qrTokenRepository;
     private final TransactionRepository transactionRepository;
     private final StoreRepository storeRepository;
     private final InventoryLockRepository inventoryLockRepository;
     private final ProductVariantRepository productVariantRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
-    private final PlatformContractService platformContractService;
+    private final CheckoutService checkoutService;
 
     private static String resolveStoreCurrencyLower(Store store) {
         if (store == null) return "usd";
@@ -63,10 +56,6 @@ public class PickupController {
     @Transactional
     public ResponseEntity<PickupVerifyResponse> verify(
             @RequestBody PickupVerifyRequest request) {
-
-        if (Stripe.apiKey == null || Stripe.apiKey.isBlank()) {
-            Stripe.apiKey = stripeConfig.getStripeApiKey();
-        }
 
         final String secureToken = (request.getSecureToken() != null) ? request.getSecureToken().trim() : null;
         final String fallbackCode = (request.getFallbackCode() != null) ? request.getFallbackCode().trim() : null;
@@ -181,38 +170,22 @@ public class PickupController {
         final Optional<Store> originatingOpt = storeRepository.findById(tx.getOriginatingStoreId());
         final Store originating = originatingOpt.orElse(null);
         final Integer marginCents = tx.getArbitrageMarginCents();
-        final int platformFeeCents = platformContractService.isFeeBased()
-                ? platformContractService.computePlatformFeeCents(marginCents != null ? marginCents : 0)
-                : 0;
-        final int payoutToOriginatingCents = Math.max(0, (marginCents != null ? marginCents : 0) - platformFeeCents);
 
-        if (originating != null
-                && originating.getStripeConnectId() != null
-                && !originating.getStripeConnectId().isBlank()
-                && !originating.getStripeConnectId().startsWith("acct_connected_")
-                && payoutToOriginatingCents > 0) {
-
-            try {
-                final TransferCreateParams params = TransferCreateParams.builder()
-                        .setAmount(Long.valueOf(payoutToOriginatingCents))
-                        .setCurrency(txCurrencyLower)
-                        .setDestination(originating.getStripeConnectId())
-                        .setTransferGroup("tx_" + tx.getId())
-                        .build();
-                final Transfer transfer = Transfer.create(params);
-                transferId = transfer.getId();
-            } catch (StripeException e) {
-                log.error("Failed to create Stripe Transfer for tx={} to store={}",
-                        tx.getId(), originating.getId(), e);
-                transferId = null;
-            }
-        }
+        // Payment Flow 2 — Hold on Platform & Split at Product Pickup.
+        // Execute Transfer A (wholesale → product owner) and Transfer B (margin − platform fee →
+        // brokerage) now that custody is proven. The platform fee is the residual kept on-platform.
+        CheckoutService.PickupSettlement settlement =
+                checkoutService.settleOnPickup(tx);
+        final String wholesaleTransferId = settlement.wholesaleTransferId();
+        final String marginTransferId = settlement.marginTransferId();
+        transferId = marginTransferId;
 
         final String qrScannedAt = now.toString();
-        final String status = transferId != null ? "settled" : "picked_up_not_settled";
-        final String message = transferId != null
-                ? "Custody verified. Margin successfully transferred to originating store."
-                : "Custody verified. Transfer creation failed - please settle margin manually via Stripe dashboard.";
+        final boolean settled = wholesaleTransferId != null || marginTransferId != null;
+        final String status = settled ? "settled" : "picked_up_not_settled";
+        final String message = settled
+                ? "Custody verified. Wholesale and margin transfers executed to their stores."
+                : "Custody verified. Transfer creation failed - please settle manually via Stripe dashboard.";
 
         final PickupVerifyResponse.PickupVerifyResponseBuilder responseBuilder = PickupVerifyResponse.builder()
                 .status(status)
@@ -221,6 +194,10 @@ public class PickupController {
                 .arbitrageMarginCents(marginCents)
                 .currency(txCurrencyUpper)
                 .stripeTransferId(transferId)
+                .wholesaleAmountCents(settlement.wholesaleCents())
+                .wholesaleTransferId(wholesaleTransferId)
+                .marginToOriginatingCents(settlement.marginToOriginatingCents())
+                .platformFeeCents(settlement.platformFeeCents())
                 .qrScannedAt(qrScannedAt)
                 .message(message);
 
@@ -228,6 +205,9 @@ public class PickupController {
             responseBuilder
                     .marginToStoreId(originating.getId())
                     .marginToStoreConnectId(originating.getStripeConnectId());
+        }
+        if (tx.getFulfillingStoreId() != null) {
+            responseBuilder.wholesaleToStoreId(tx.getFulfillingStoreId());
         }
 
         return ResponseEntity.ok(responseBuilder.build());
