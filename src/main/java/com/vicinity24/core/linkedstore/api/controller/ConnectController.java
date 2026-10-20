@@ -655,13 +655,9 @@ public class ConnectController {
             final UUID txId;
             try { txId = UUID.fromString(txIdRaw); }
             catch (IllegalArgumentException iae) { log.warn("Connect: invalid transactionId metadata {}", txIdRaw); return; }
-            final boolean explicitPayouts = metadata != null
-                    && (metadata.get("splitFallback") != null
-                        || "true".equalsIgnoreCase(metadata.get("splitFallback"))
-                        || metadata.get("fulfillingConnectId") != null);
             final String piId = session.getPaymentIntent();
-            checkoutService.finalizeTransactionPaidAfterStripe(txId, piId, explicitPayouts);
-            log.info("Connect: checkout.session.completed finalized tx={} pi={} explicitPayouts={}", txId, piId, explicitPayouts);
+            checkoutService.finalizeTransactionPaidAfterStripe(txId, piId);
+            log.info("Connect: checkout.session.completed finalized tx={} pi={}", txId, piId);
         } catch (Exception ex) {
             log.error("Connect: handleCheckoutSessionCompleted failed for event {}", event.getId(), ex);
         }

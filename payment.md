@@ -55,7 +55,7 @@ sequenceDiagram
 - `POST /api/connect/login-link` — opens the store owner's Stripe Express dashboard (only after onboarding is complete).
 - `GET /api/connect/health` — reports whether Stripe Connect is activated on the platform account.
 
-A store is considered **onboarded** when its `stripeConnectId` is set, non-blank, and does **not** start with the placeholder `acct_connected_`. Onboarded stores can receive declarative `transfer_data` at checkout; non-onboarded stores fall back to explicit post-custody Transfers.
+A store is considered **onboarded** when its `stripeConnectId` is set, non-blank, and does **not** start with the placeholder `acct_connected_`. In **Payment Flow 2**, no money moves to any store at checkout — the full retail amount is held on the platform, and onboarded stores receive their payout via explicit Transfers at verified pickup. Stores that are not onboarded simply skip their transfer at pickup (settlement is reported as partial and can be retried).
 
 ---
 
@@ -63,13 +63,15 @@ A store is considered **onboarded** when its `stripeConnectId` is set, non-blank
 
 ### Money split
 
-A single retail price is split three ways:
+A single retail price is split three ways. In **Payment Flow 2 ("Hold on Platform & Split at Product Pickup")** the customer's payment is captured and **held entirely on the platform account**; nothing is paid out until the product is picked up.
 
-| Leg | Recipient | When paid |
-|---|---|---|
-| Wholesale payout | Fulfilling store | At capture (declarative `transfer_data`) **or** at custody proof (explicit Transfer fallback) |
-| Arbitrage margin | Originating store | At **pickup / custody proof** (explicit Transfer) — held by platform until customer physically receives goods |
-| Platform fee | Platform | Remainder after wholesale + margin; captured as `application_fee_amount` |
+| Leg | Recipient | When paid | Stripe object |
+|---|---|---|---|
+| Wholesale payout (Transfer A) | Fulfilling store (product owner) | At **pickup / custody proof** | `Transfer.create(source_transaction)` |
+| Arbitrage margin (Transfer B) | Originating store (broker), minus platform fee | At **pickup / custody proof** | `Transfer.create(source_transaction)` |
+| Platform fee | Platform | **Residual** — never transferred; simply remains on the platform balance | — |
+
+All three legs share the transaction's `transfer_group` (`tx_<transactionId>`), which is also set on the charge itself, so the whole lifecycle can be reconciled (and reversed) as one group.
 
 ### End-to-end sequence
 
@@ -87,28 +89,24 @@ sequenceDiagram
     Cust->>FE: Select product, click Buy
     FE->>BE: POST /api/checkout/sessions<br/>{productId, variantId?, originatingStoreId}
     BE->>BE: Create Transaction (RESERVED)<br/>Create InventoryLock (HELD, 15 min)<br/>Create QrToken, assign runner
-    alt Fulfilling store onboarded (transfers capability)
-        BE->>Stripe: Checkout.Session.create<br/>mode=payment<br/>line_items = retail total (1 item)<br/>payment_intent_data.transfer_data = wholesale → fulfilling store<br/>application_fee_amount = platform fee
-    else Not onboarded / capability error
-        BE->>Stripe: Checkout.Session.create<br/>mode=payment (no transfer_data)<br/>metadata.splitFallback = true<br/>metadata.wholesalePayoutCents, arbitrageMarginCents
-    end
+    BE->>Stripe: Checkout.Session.create<br/>mode=payment<br/>line_items = retail total (1 item)<br/>payment_intent_data.transfer_group = tx_&lt;id&gt;<br/>(no transfer_data, no application_fee_amount)
     Stripe-->>BE: session {id, url}
     BE-->>FE: {id, url, status}
     FE-->>Cust: Redirect to Stripe Checkout
     Cust->>Stripe: Pay
     Stripe-->>Cust: Redirect to success_url
     Stripe->>WH: checkout.session.completed
-    WH->>Svc: finalizeTransactionPaidAfterStripe(txId, piId, explicitPayouts)
-    Svc->>BE: tx.status = PAID<br/>InventoryLock → RELEASED_TO_SALE<br/>Generate QrToken if missing, assign runner
-    alt Fallback mode (explicitPayouts)
-        Svc->>Stripe: Transfer wholesale → fulfilling store<br/>Transfer margin → originating store<br/>(transferGroup = tx_<id>)
-    end
+    WH->>Svc: finalizeTransactionPaidAfterStripe(txId, piId)
+    Svc->>BE: tx.status = PAID<br/>InventoryLock → RELEASED_TO_SALE<br/>Generate QrToken if missing, assign runner<br/>(NO transfers — funds stay on platform)
     Svc-->>BE: Broadcast PAID event (SSE)
     Cust->>Staff: Show QR / 8-digit code at store
     Staff->>Pick: POST /api/pickup/verify {secureToken or fallbackCode}
     Pick->>BE: Validate QR (unused, unexpired)<br/>Mark scanned<br/>tx.status = PICKED_UP
-    Pick->>Stripe: Transfer arbitrage margin → originating store<br/>(transferGroup = tx_<id>)
-    Pick-->>Staff: {status: settled, stripeTransferId}
+    Pick->>Svc: settleOnPickup(tx)
+    Svc->>Stripe: Transfer A: wholesale → fulfilling store<br/>(transfer_group = tx_&lt;id&gt;, source_transaction = ch_...)
+    Svc->>Stripe: Transfer B: margin − platform fee → originating store<br/>(transfer_group = tx_&lt;id&gt;, source_transaction = ch_...)
+    Note over Svc,Stripe: Platform fee remains on the platform balance (residual)
+    Pick-->>Staff: {status: settled, wholesaleTransferId, stripeTransferId, platformFeeCents}
 ```
 
 ### Checkout session creation details
@@ -118,20 +116,19 @@ The single endpoint `POST /api/checkout/sessions` branches on whether a `transac
 - **`transactionId` present** → `createSplitLedgerSession`: the transaction already exists (e.g. created via the reservation flow). Reuses the stored wholesale / margin amounts.
 - **`transactionId` absent** → `createSingleAccountSession`: builds the transaction inline from `productId` + `variantId`, computing `retailCents`, `wholesaleCents` (default `60%` of retail if missing), and `marginCents = retail − wholesale`.
 
-In both paths the Stripe Checkout line item is **always exactly one item at the retail total**. The wholesale and margin are never surfaced to the customer — they are moved via `transfer_data` or post-capture Transfers.
+In both paths the Stripe Checkout line item is **always exactly one item at the retail total**. The wholesale and margin are never surfaced to the customer — they are only moved later, at pickup, via explicit post-custody Transfers. Both paths set `payment_intent_data.transfer_group = tx_<transactionId>` on the charge and store the settlement mode `hold-on-platform` in the session metadata.
 
-### Two transfer strategies
+### Settlement strategy (single Flow 2 path)
 
 ```mermaid
 flowchart TD
-    A[POST /api/checkout/sessions] --> B{Fulfilling store onboarded<br/>&amp; transfers capability?}
-    B -- Yes --> C[Declarative transfer_data]
-    C --> C1[wholesale → fulfilling store at capture<br/>application_fee_amount = platform fee<br/>margin held by platform]
-    B -- No / capability error --> D[Fallback: no transfer_data]
-    D --> D1[metadata.splitFallback=true<br/>wholesale &amp; margin moved via explicit Transfers<br/>after payment custody]
-    C1 --> E[Pickup verify]
-    D1 --> E
-    E --> F[Transfer margin → originating store<br/>transferGroup=tx_&#60;id&#62;]
+    A[POST /api/checkout/sessions] --> B[Checkout.Session.create<br/>line_items = retail total<br/>payment_intent_data.transfer_group = tx_&lt;id&gt;<br/>NO transfer_data / application_fee]
+    B --> C[Customer pays → full amount held on platform account]
+    C --> D[tx.status = PAID via webhook / confirm / direct pay<br/>NO transfers at this stage]
+    D --> E[Pickup verify → custody proven]
+    E --> F[settleOnPickup: Transfer A wholesale → fulfilling store]
+    F --> G[settleOnPickup: Transfer B margin − fee → originating store]
+    G --> H[Platform fee stays as residual on platform<br/>transfer_group = tx_&lt;id&gt; on charge + both transfers]
 ```
 
 ### Payment confirmation paths
@@ -142,7 +139,7 @@ The transaction reaches `PAID` through one of three channels:
 2. **Frontend poll:** After redirect to `success_url`, the frontend calls `POST /api/checkout/confirm-session-paid {sessionId}`. The backend retrieves the session from Stripe, verifies `paymentStatus=paid`, and calls `finalizeTransactionPaidAfterStripe`.
 3. **Direct PaymentIntent:** `POST /api/checkout/pay` creates and confirms a Stripe PaymentIntent directly (used by the embedded card flow), then finalizes.
 
-All three converge on `CheckoutService.finalizeTransactionPaidAfterStripe(transactionId, paymentIntentId, explicitPayouts)`, so the post-payment state machine is identical regardless of entry point.
+All three converge on `CheckoutService.finalizeTransactionPaidAfterStripe(transactionId, paymentIntentId)`, so the post-payment state machine is identical regardless of entry point. In Flow 2 this method **never** creates transfers — it only marks the transaction `PAID` and prepares the pickup QR token; the money stays on the platform until `PickupController` calls `settleOnPickup`.
 
 ### Transaction state machine
 
@@ -164,7 +161,7 @@ stateDiagram-v2
 
 ## 4. Pickup & Custody Proof
 
-The arbitrage **margin is held by the platform** until the customer physically picks up the goods. This is the "custody proof" model: the fulfilling store has the inventory, the originating store listed it, and the margin only moves to the originating store once the customer confirms receipt.
+The **entire retail amount is held by the platform** until the customer physically picks up the goods. This is the "custody proof" model: the fulfilling store has the inventory, the originating store listed it, and **both** the wholesale payout and the arbitrage margin only move once the customer confirms receipt.
 
 ### Pickup flow
 
@@ -176,13 +173,19 @@ flowchart LR
     D --> E{QR valid &amp; unscanned?}
     E -- No --> F[Reject: invalid / expired / already_scanned]
     E -- Yes --> G[Mark QR scanned<br/>tx.status = PICKED_UP]
-    G --> H[Stripe Transfer: margin → originating store<br/>transferGroup = tx_&#60;id&#62;]
-    H --> I[Return status=settled]
+    G --> H[settleOnPickup]
+    H --> I[Transfer A: wholesale → fulfilling store<br/>transfer_group = tx_&#60;id&#62;, source_transaction = ch_...]
+    H --> J[Transfer B: margin − platform fee → originating store<br/>transfer_group = tx_&#60;id&#62;, source_transaction = ch_...]
+    I --> K[Platform fee stays as residual on platform]
+    J --> K
+    K --> L[Return status=settled<br/>{wholesaleTransferId, stripeTransferId, platformFeeCents}]
 ```
 
 The QR token (`secureToken`, prefix `ls_`) and a human-readable 8-digit `fallbackCode` are generated at reservation time and stored in `qr_tokens`. The token expires after 60 minutes; the inventory lock expires after 15 minutes.
 
-If the margin Transfer fails (e.g. originating store not yet onboarded), the endpoint returns `picked_up_not_settled` and the margin must be settled manually via the Stripe dashboard.
+Both transfers are created with `source_transaction` set to the original charge (`ch_...`, resolved from the payment intent's `latest_charge`) so they draw from the payment's funds even while those funds are still pending. Both carry the `route` metadata (`WHOLESALE_TO_FULFILLING` / `MARGIN_TO_ORIGINATING`) used by the refund/reversal module to identify each leg.
+
+If a transfer fails (e.g. a store is not yet onboarded, or Stripe rejects the call), the endpoint returns `picked_up_not_settled`; the affected leg must be settled manually via the Stripe dashboard. Because the QR scan is claimed atomically (`markAsScannedIfNotAlreadyScanned`), `settleOnPickup` runs **at most once per transaction**, preventing double payout.
 
 ---
 
@@ -242,13 +245,13 @@ If `STRIPE_WEBHOOK_SECRET` is not set, signature verification is skipped with a 
 
 ---
 
-## 7. Worked Example: Store Onboarding → Customer Purchase
+## 7. Worked Example: Store Onboarding → Customer Purchase (Flow 2)
 
 **Setup:**
 - Store A ("Mama's Bakery", the *originating* store) lists a cake at **$20 retail**.
 - Store B ("Corner Cafe", the *fulfilling* store) holds the physical inventory; wholesale price recorded as **$12**.
 - Arbitrage margin = $20 − $12 = **$8** to Store A.
-- Platform fee = $0 (in this example the platform takes no fee; if it did, it would be `retail − wholesale − margin`).
+- Assume the platform runs in **FEE_BASED** mode at **10%** → platform fee = 10% × $8 = **$0.80**, so Store A receives **$7.20** and the platform keeps **$0.80** as the residual.
 
 ### Step 1 — Store B onboards Stripe
 
@@ -269,19 +272,18 @@ Same as Step 1 → `storeA.stripeConnectId = "acct_originA"`.
    - Creates `Transaction { originatingStoreId: A, fulfillingStoreId: B, totalRetailCents: 2000, wholesalePayoutCents: 1200, arbitrageMarginCents: 800, status: RESERVED }`.
    - Creates `InventoryLock { variantId, status: HELD, expiresAt: +15min }`.
    - Creates `QrToken { secureToken: "ls_...", fallbackCode: "12345678", expiresAt: +60min }`.
-   - Store B is onboarded, so it creates a Stripe Checkout Session with:
+   - Creates a Stripe Checkout Session with:
      - `line_items`: 1 × cake @ $20.00
-     - `payment_intent_data.transfer_data`: `{ destination: "acct_fulfillB", amount: 1200 }` (wholesale to Store B)
-     - `application_fee_amount`: 0 (no platform fee)
-     - `metadata.transactionId`: the new transaction id
+     - `payment_intent_data.transfer_group`: `"tx_<id>"`
+     - **no** `transfer_data` and **no** `application_fee_amount` (Flow 2 holds the full amount on the platform)
+     - `metadata.transactionId`: the new transaction id, `metadata.settlementMode`: `hold-on-platform`
 4. Customer is redirected to Stripe Checkout and pays $20.
-5. Stripe captures $20. Of that:
-   - $12 goes to Store B immediately (declarative transfer).
-   - $8 stays in the platform's Stripe balance (held margin for Store A).
-6. Stripe posts `checkout.session.completed` → webhook → `finalizeTransactionPaidAfterStripe(txId, piId, explicitPayouts=false)`.
+5. Stripe captures the **full $20 and holds it on the platform account**. Nothing has moved to Store A or Store B yet.
+6. Stripe posts `checkout.session.completed` → webhook → `finalizeTransactionPaidAfterStripe(txId, piId)`.
    - `tx.status = PAID`.
    - `InventoryLock` → `RELEASED_TO_SALE`.
    - QR token already exists; runner assigned.
+   - **No transfers created.**
    - Broadcasts `PAID` SSE event.
 
 ### Step 4 — Customer picks up the cake (custody proof)
@@ -291,17 +293,20 @@ Same as Step 1 → `storeA.stripeConnectId = "acct_originA"`.
 3. Backend:
    - Validates token (unused, unexpired) and marks it scanned.
    - `tx.status = PICKED_UP`.
-   - Creates a Stripe `Transfer { amount: 800, destination: "acct_originA", transferGroup: "tx_<id>" }` — the **$8 margin is now released to Store A**.
-4. Response: `{ status: "settled", stripeTransferId: "tr_..." }`.
+   - Resolves the original charge `ch_...` from the payment intent.
+   - **Transfer A:** `Transfer { amount: 1200, destination: "acct_fulfillB", transferGroup: "tx_<id>", source_transaction: "ch_...", metadata.route: "WHOLESALE_TO_FULFILLING" }` → **$12 wholesale to Store B**.
+   - **Transfer B:** `Transfer { amount: 720, destination: "acct_originA", transferGroup: "tx_<id>", source_transaction: "ch_...", metadata.route: "MARGIN_TO_ORIGINATING" }` → **$7.20 net margin to Store A**.
+   - The **$0.80 platform fee is the residual** that stays on the platform balance.
+4. Response: `{ status: "settled", wholesaleTransferId: "tr_...A", stripeTransferId: "tr_...B", platformFeeCents: 80 }`.
 
 ### Final money positions
 
 | Party | Received |
 |---|---|
 | Customer | Paid $20, received cake |
-| Store B (fulfilling) | $12 wholesale (at capture) |
-| Store A (originating) | $8 margin (at pickup/custody proof) |
-| Platform | $0 fee (Stripe processing fees deducted from each leg) |
+| Store B (fulfilling) | $12 wholesale (Transfer A, at pickup) |
+| Store A (originating) | $7.20 net margin = $8 margin − $0.80 platform fee (Transfer B, at pickup) |
+| Platform | $0.80 fee retained as residual (FEE_BASED mode); $0 in SUBSCRIPTION mode (Stripe processing fees deducted separately) |
 
 ---
 

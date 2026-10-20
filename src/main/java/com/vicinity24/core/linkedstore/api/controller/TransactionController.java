@@ -57,7 +57,7 @@ public class TransactionController {
         try { id = UUID.fromString(idStr); } catch (IllegalArgumentException e) { return ResponseEntity.badRequest().build(); }
         Transaction tx = transactionRepository.findById(id).orElse(null);
         if (tx == null) return ResponseEntity.notFound().build();
-        checkoutService.finalizeTransactionPaidAfterStripe(id, pi, false);
+        checkoutService.finalizeTransactionPaidAfterStripe(id, pi);
         tx = transactionRepository.findById(id).orElse(tx);
         return ResponseEntity.ok(buildTransactionResponse(tx));
     }

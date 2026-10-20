@@ -17,4 +17,10 @@ public class PayoutRequest {
     private String destinationAccountId;
     private String transferGroup;
     private String route;
+    /**
+     * Optional Stripe charge (ch_...) to draw this transfer from. When the funds are still
+     * pending (separate charges and transfers), the transfer must reference the originating
+     * charge via source_transaction, otherwise Stripe debits the platform's available balance.
+     */
+    private String sourceTransaction;
 }

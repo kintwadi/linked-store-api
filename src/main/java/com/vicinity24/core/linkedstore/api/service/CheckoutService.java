@@ -1,6 +1,7 @@
 package com.vicinity24.core.linkedstore.api.service;
 
 import com.stripe.Stripe;
+import com.stripe.model.PaymentIntent;
 import com.vicinity24.core.linkedstore.api.config.StripeConfig;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutPayRequest;
 import com.vicinity24.core.linkedstore.api.dto.CheckoutPayResponse;
@@ -51,6 +52,7 @@ public class CheckoutService {
     private final StripeConfig stripeConfig;
     private final PaymentProviderFactory paymentProviderFactory;
     private final TransactionEventBroadcaster eventBroadcaster;
+    private final PlatformContractService platformContractService;
 
     private static final int QR_TOKEN_TTL_MINUTES = 60;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
@@ -109,12 +111,19 @@ public class CheckoutService {
         Store fulfillingStore = storeRepository.findById(fulfillsStoreId)
                 .orElseThrow(() -> new ResourceNotFoundException("Fulfilling Store", fulfillsStoreId.toString()));
 
-        String transferGroup = "tx_" + transactionId.toString().replace("-", "");
+        // Canonical transfer_group shared by the charge and the pickup-time transfers. Must
+        // match settleOnPickup() and RefundService (which lists transfers by this exact group).
+        String transferGroup = "tx_" + transactionId.toString();
 
         int totalCents = transaction.getTotalRetailCents();
         int wholesalePayoutCents = transaction.getWholesalePayoutCents();
         int marginCents = transaction.getArbitrageMarginCents();
-        int platformFeeCents = 0;
+        // The platform fee is DERIVED from the arbitrage margin (FEE_BASED mode) and is retained as a
+        // residual when the split executes at pickup. It is never added on top of the customer's
+        // charge — the customer is charged exactly the transaction's total retail amount.
+        int platformFeeCents = platformContractService.isFeeBased()
+                ? platformContractService.computePlatformFeeCents(marginCents)
+                : 0;
         final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
         final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
@@ -137,19 +146,10 @@ public class CheckoutService {
         locks.forEach(lock -> inventoryLockRepository.updateStatusIfCurrentStatusIs(
                 lock.getId(), InventoryLockStatus.RELEASED_TO_SALE, InventoryLockStatus.HELD));
 
-        try {
-            executeSplitLedgerPayouts(
-                    paymentProvider,
-                    transferGroup,
-                    wholesalePayoutCents,
-                    marginCents,
-                    originatingStore.getStripeConnectId(),
-                    fulfillingStore.getStripeConnectId(),
-                    txCurrencyLower);
-        } catch (StripePaymentFailedException e) {
-            log.error("Provider {} split payouts failed for tx={}, payment_intent={}",
-                    paymentProvider.providerId(), transactionId, paymentIntent.getPaymentIntentId(), e);
-        }
+        // Payment Flow 2 — Hold on Platform & Split at Product Pickup.
+        // The full retail amount stays on the platform account after capture. No transfers are
+        // created here; wholesale + margin transfers are executed by settleOnPickup() when the
+        // customer picks up the product.
 
         // Runner: if the reservation flow already assigned one, reuse it.
         // Otherwise prefer fulfilling store runners (pickup happens there), else originating
@@ -275,48 +275,131 @@ public class CheckoutService {
         return provider.capturePayment(paymentRequest);
     }
 
-    private void executeSplitLedgerPayouts(
-            PaymentProvider provider,
-            String transferGroup,
-            int wholesalePayoutCents,
-            int marginCents,
-            String originatingStripeConnectId,
-            String fulfillingStripeConnectId,
-            String currencyLower) {
-
-        final String currency = currencyLower != null ? currencyLower : "usd";
-
-        if (wholesalePayoutCents > 0) {
-            PayoutRequest pr = PayoutRequest.builder()
-                    .provider(provider.providerId())
-                    .amountCents(wholesalePayoutCents)
-                    .currency(currency)
-                    .destinationAccountId(fulfillingStripeConnectId)
-                    .transferGroup(transferGroup)
-                    .route("WHOLESALE_TO_FULFILLING")
-                    .build();
-            PayoutResponse tx = provider.payout(pr);
-            log.info("{} wholesale payout: id={}, amount={}c, dest={}, group={}",
-                    provider.providerId(), tx.getPayoutId(), wholesalePayoutCents, fulfillingStripeConnectId, transferGroup);
+    /**
+     * Payment Flow 2 settlement — executed once the product is picked up.
+     *
+     * Funds were captured and held on the platform account at checkout. Here we execute two
+     * distinct transfers sharing the transaction's {@code transfer_group}:
+     * <ul>
+     *   <li>Transfer A: wholesale payout → product owner (fulfilling store)</li>
+     *   <li>Transfer B: arbitrage margin minus platform fee → brokerage (originating store)</li>
+     * </ul>
+     * The platform fee (FEE_BASED mode) is the residual that stays on the platform account.
+     */
+    @Transactional
+    public PickupSettlement settleOnPickup(Transaction tx) {
+        if (tx == null) {
+            return new PickupSettlement(null, null, 0, 0, 0, 0);
+        }
+        final Store originating = tx.getOriginatingStoreId() != null
+                ? storeRepository.findById(tx.getOriginatingStoreId()).orElse(null) : null;
+        final Store fulfilling = tx.getFulfillingStoreId() != null
+                ? storeRepository.findById(tx.getFulfillingStoreId()).orElse(null) : null;
+        if (originating == null || fulfilling == null) {
+            log.warn("settleOnPickup: missing store(s) for tx={}, skipping settlement", tx.getId());
+            return new PickupSettlement(null, null, 0, 0, 0, 0);
         }
 
-        if (marginCents > 0) {
-            PayoutRequest pr = PayoutRequest.builder()
-                    .provider(provider.providerId())
-                    .amountCents(marginCents)
-                    .currency(currency)
-                    .destinationAccountId(originatingStripeConnectId)
-                    .transferGroup(transferGroup)
-                    .route("MARGIN_TO_ORIGINATING")
-                    .build();
-            PayoutResponse tx = provider.payout(pr);
-            log.info("{} margin payout: id={}, amount={}c, dest={}, group={}",
-                    provider.providerId(), tx.getPayoutId(), marginCents, originatingStripeConnectId, transferGroup);
+        final String currencyLower = resolveStoreCurrencyLower(fulfilling);
+        final int wholesaleCents = tx.getWholesalePayoutCents() != null ? tx.getWholesalePayoutCents() : 0;
+        final int marginCents = tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0;
+        final int platformFeeCents = platformContractService.isFeeBased()
+                ? platformContractService.computePlatformFeeCents(marginCents)
+                : 0;
+        final int marginToOriginatingCents = Math.max(0, marginCents - platformFeeCents);
+
+        final String transferGroup = "tx_" + tx.getId().toString();
+        final String sourceTransaction = resolveChargeIdForSettlement(tx.getStripePaymentIntentId());
+        final PaymentProvider provider = paymentProviderFactory.defaultProvider();
+
+        String wholesaleTransferId = null;
+        if (wholesaleCents > 0 && isUsableConnectId(fulfilling.getStripeConnectId())) {
+            try {
+                final PayoutResponse r = provider.payout(PayoutRequest.builder()
+                        .provider(provider.providerId())
+                        .amountCents(wholesaleCents)
+                        .currency(currencyLower)
+                        .destinationAccountId(fulfilling.getStripeConnectId())
+                        .transferGroup(transferGroup)
+                        .route("WHOLESALE_TO_FULFILLING")
+                        .sourceTransaction(sourceTransaction)
+                        .build());
+                wholesaleTransferId = r.getPayoutId();
+                log.info("settleOnPickup: wholesale transfer {} amount={}c dest={} tx={}",
+                        wholesaleTransferId, wholesaleCents, fulfilling.getStripeConnectId(), tx.getId());
+            } catch (Exception e) {
+                log.error("settleOnPickup: wholesale transfer failed tx={} dest={}",
+                        tx.getId(), fulfilling.getStripeConnectId(), e);
+            }
+        } else {
+            log.warn("settleOnPickup: skipping wholesale transfer tx={} (amount={}c, connectId={})",
+                    tx.getId(), wholesaleCents, fulfilling.getStripeConnectId());
         }
 
-        log.debug("Split ledger complete for provider={} group={}: wholesale={}c -> fulfilling, margin={}c -> originating, platform=0c",
-                provider.providerId(), transferGroup, wholesalePayoutCents, marginCents);
+        String marginTransferId = null;
+        if (marginToOriginatingCents > 0 && isUsableConnectId(originating.getStripeConnectId())) {
+            try {
+                final PayoutResponse r = provider.payout(PayoutRequest.builder()
+                        .provider(provider.providerId())
+                        .amountCents(marginToOriginatingCents)
+                        .currency(currencyLower)
+                        .destinationAccountId(originating.getStripeConnectId())
+                        .transferGroup(transferGroup)
+                        .route("MARGIN_TO_ORIGINATING")
+                        .sourceTransaction(sourceTransaction)
+                        .build());
+                marginTransferId = r.getPayoutId();
+                log.info("settleOnPickup: margin transfer {} amount={}c dest={} tx={}",
+                        marginTransferId, marginToOriginatingCents, originating.getStripeConnectId(), tx.getId());
+            } catch (Exception e) {
+                log.error("settleOnPickup: margin transfer failed tx={} dest={}",
+                        tx.getId(), originating.getStripeConnectId(), e);
+            }
+        } else {
+            log.warn("settleOnPickup: skipping margin transfer tx={} (amount={}c, connectId={})",
+                    tx.getId(), marginToOriginatingCents, originating.getStripeConnectId());
+        }
+
+        log.info("settleOnPickup complete tx={} group={}: wholesale={}c, marginToOriginating={}c, platformFee={}c",
+                tx.getId(), transferGroup, wholesaleCents, marginToOriginatingCents, platformFeeCents);
+
+        return new PickupSettlement(
+                wholesaleTransferId, marginTransferId,
+                wholesaleCents, marginToOriginatingCents, platformFeeCents, marginCents);
     }
+
+    private static boolean isUsableConnectId(String connectId) {
+        return connectId != null && !connectId.isBlank() && !connectId.startsWith("acct_connected_");
+    }
+
+    /**
+     * Resolves the charge backing the payment so the settlement transfers can draw from the
+     * (possibly still pending) funds of that specific charge. Returns null when unavailable, in
+     * which case Stripe falls back to the platform's available balance.
+     */
+    private String resolveChargeIdForSettlement(String paymentIntentId) {
+        if (paymentIntentId == null || paymentIntentId.isBlank()) return null;
+        try {
+            if (Stripe.apiKey == null || Stripe.apiKey.isBlank()) {
+                Stripe.apiKey = stripeConfig.getStripeApiKey();
+            }
+            final PaymentIntent pi = PaymentIntent.retrieve(paymentIntentId);
+            return pi.getLatestCharge();
+        } catch (Exception e) {
+            log.warn("settleOnPickup: could not resolve charge for paymentIntent={} ({})",
+                    paymentIntentId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Result of a pickup-time settlement. */
+    public record PickupSettlement(
+            String wholesaleTransferId,
+            String marginTransferId,
+            int wholesaleCents,
+            int marginToOriginatingCents,
+            int platformFeeCents,
+            int arbitrageMarginCents) {}
 
     /**
      * Pick a runner for handoff. Pickup happens at the FULFILLING store so we always prefer
@@ -384,7 +467,7 @@ public class CheckoutService {
     }
 
     @Transactional
-    public void finalizeTransactionPaidAfterStripe(UUID transactionId, String paymentIntentId, boolean doExplicitPayouts) {
+    public void finalizeTransactionPaidAfterStripe(UUID transactionId, String paymentIntentId) {
         final Transaction tx = transactionRepository.findById(transactionId).orElse(null);
         if (tx == null) {
             log.warn("finalizePaidAfterStripe: tx {} not found, skipping", transactionId);
@@ -416,23 +499,7 @@ public class CheckoutService {
         final String txCurrencyLower = resolveStoreCurrencyLower(fulfillingStore);
         final String txCurrencyUpper = txCurrencyLower.toUpperCase(Locale.ROOT);
 
-        if (doExplicitPayouts && originatingStore != null && fulfillingStore != null) {
-            try {
-                final String transferGroup = "tx_" + transactionId.toString().replace("-", "");
-                final int wholesale = tx.getWholesalePayoutCents() != null ? tx.getWholesalePayoutCents() : 0;
-                final int margin = tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0;
-                executeSplitLedgerPayouts(
-                        paymentProviderFactory.defaultProvider(),
-                        transferGroup,
-                        wholesale,
-                        margin,
-                        originatingStore.getStripeConnectId(),
-                        fulfillingStore.getStripeConnectId(),
-                        txCurrencyLower);
-            } catch (Exception ex) {
-                log.error("finalizePaidAfterStripe: explicit split payouts failed tx={}", transactionId, ex);
-            }
-        }
+        // Payment Flow 2 — funds stay on the platform until pickup; no transfers happen here.
 
         UUID runnerId = tx.getRunnerId();
         if (runnerId == null && originatingStore != null && fulfillingStore != null) {

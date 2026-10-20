@@ -176,10 +176,12 @@ Hyperlocal flow (1 transaction = 2 stores + a runner):
    items they don't have in stock.
 2. **Fulfilling store** is the location with actual stock (chosen by the
    inventory availability endpoint).
-3. Payment goes through Stripe — **split ledger**:
-   - Wholesale payout → fulfilling store's Stripe Connect ID
-   - Margin → originating store
-   - `platform_fee_cents` (default 0) → platform account.
+3. Payment goes through Stripe — **split ledger** (Payment Flow 2: *Hold on Platform & Split at Product Pickup*):
+   - The full retail amount is **captured and held on the platform account** at checkout — no money moves to either store yet.
+   - At verified pickup the platform executes two transfers sharing the transaction's `transfer_group`:
+     - **Transfer A — wholesale payout** → fulfilling store's Stripe Connect ID
+     - **Transfer B — margin** (minus platform fee) → originating store
+   - `platform_fee_cents` (in FEE_BASED mode) stays on the platform account as the residual.
 4. A **QR token** + **fallback code** are generated. The runner scans the QR
    code at the fulfilling store (`/runner/pickup`) to mark the pickup.
 5. Status transitions: `PAID → IN_TRANSIT → READY_FOR_PICKUP → DELIVERED`.

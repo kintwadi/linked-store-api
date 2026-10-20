@@ -149,10 +149,6 @@ public class CheckoutController {
                     .build());
         }
 
-        final boolean storeNotOnboarded = fulfillingStore.getStripeConnectId() == null
-                || fulfillingStore.getStripeConnectId().isBlank()
-                || fulfillingStore.getStripeConnectId().startsWith("acct_connected_");
-
         UUID variantId = null;
         final List<InventoryLock> locks = inventoryLockRepository.findByTransactionId(tx.getId());
         if (!locks.isEmpty()) {
@@ -190,64 +186,6 @@ public class CheckoutController {
                 ? product.getTitle()
                 : (request.getTitle() != null ? request.getTitle() : "Linked-Store Purchase");
 
-        if (storeNotOnboarded) {
-            try {
-                final List<String> imagesFb = new ArrayList<>();
-                if (imageUrl != null && !imageUrl.isBlank()) imagesFb.add(imageUrl);
-                final Map<String, Object> productDataFb = new HashMap<>();
-                productDataFb.put("name", productTitle);
-                if (!imagesFb.isEmpty()) productDataFb.put("images", imagesFb);
-                final Map<String, Object> priceDataFb = new HashMap<>();
-                priceDataFb.put("currency", txCurrencyLower);
-                priceDataFb.put("unit_amount", tx.getTotalRetailCents());
-                priceDataFb.put("product_data", productDataFb);
-                final Map<String, Object> lineItemFb = new HashMap<>();
-                lineItemFb.put("quantity", 1L);
-                lineItemFb.put("price_data", priceDataFb);
-                final List<Object> lineItemsFb = new ArrayList<>();
-                lineItemsFb.add(lineItemFb);
-
-                final Map<String, String> metaFb = new HashMap<>();
-                metaFb.put("transactionId", tx.getId().toString());
-                metaFb.put("fulfillingConnectId", fulfillingStore.getStripeConnectId() != null ? fulfillingStore.getStripeConnectId() : "");
-                metaFb.put("originatingConnectId",
-                        storeRepository.findById(tx.getOriginatingStoreId())
-                                .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "").orElse(""));
-                metaFb.put("wholesalePayoutCents", String.valueOf(tx.getWholesalePayoutCents()));
-                metaFb.put("arbitrageMarginCents", String.valueOf(tx.getArbitrageMarginCents()));
-                metaFb.put("splitFallback", "store-not-onboarded; explicit Transfers will reconcile after custody.");
-
-                final Map<String, Object> paramsFb = new HashMap<>();
-                paramsFb.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
-                paramsFb.put("success_url", request.getSuccessUrl());
-                paramsFb.put("cancel_url", request.getCancelUrl());
-                paramsFb.put("line_items", lineItemsFb);
-                paramsFb.put("allow_promotion_codes", Boolean.TRUE);
-                paramsFb.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
-                paramsFb.put("metadata", metaFb);
-                if (request.getCustomerEmail() != null && !request.getCustomerEmail().isBlank()) {
-                    paramsFb.put("customer_email", request.getCustomerEmail());
-                }
-
-                assertSingleLineItemOnly(paramsFb);
-                final Session fallback = Session.create(paramsFb);
-                return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
-                        .id(fallback.getId())
-                        .url(fallback.getUrl())
-                        .status("ok_fallback_split")
-                        .message("Fallback: fulfilling store has not yet onboarded Stripe Connect. " +
-                                "Platform will issue explicit wholesale + margin transfers after custody proof.")
-                        .build());
-            } catch (StripeException fbEx) {
-                log.error("Fallback (not-onboarded) checkout also failed for tx={}", request.getTransactionId(), fbEx);
-                final String msg = fbEx.getUserMessage() != null ? fbEx.getUserMessage() : fbEx.getMessage();
-                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(CheckoutSessionResponse.builder()
-                        .status("error")
-                        .message(msg)
-                        .build());
-            }
-        }
-
         try {
             final List<String> images = new ArrayList<>();
             if (imageUrl != null && !imageUrl.isBlank()) {
@@ -272,22 +210,20 @@ public class CheckoutController {
             final List<Object> lineItems = new ArrayList<>();
             lineItems.add(lineItem);
 
+            // Payment Flow 2 — Hold on Platform & Split at Product Pickup.
+            // The full retail amount is captured and held on the platform account. No declarative
+            // transfer_data / application_fee is attached here. Wholesale (product owner) and
+            // margin (broker, minus platform fee) are transferred explicitly at pickup.
             final Map<String, String> metadata = new HashMap<>();
             metadata.put("transactionId", tx.getId().toString());
-
-            final long platformFeeCents;
-            if (platformContractService.isFeeBased()) {
-                platformFeeCents = platformContractService.computePlatformFeeCents(
-                        tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0);
-            } else {
-                platformFeeCents = 0L;
-            }
-
-            final long wholesaleCents = tx.getWholesalePayoutCents() != null ? tx.getWholesalePayoutCents() : 0L;
-            final long retailCents = tx.getTotalRetailCents() != null ? tx.getTotalRetailCents() : 0L;
-            final long transferCap = Math.max(0L, retailCents - platformFeeCents);
-            final long realTransfer = Math.min(wholesaleCents, transferCap);
-            final boolean canSplitTransfer = realTransfer > 0 && wholesaleCents <= retailCents;
+            metadata.put("wholesalePayoutCents", String.valueOf(tx.getWholesalePayoutCents()));
+            metadata.put("arbitrageMarginCents", String.valueOf(tx.getArbitrageMarginCents()));
+            metadata.put("fulfillingConnectId",
+                    fulfillingStore.getStripeConnectId() != null ? fulfillingStore.getStripeConnectId() : "");
+            metadata.put("originatingConnectId",
+                    storeRepository.findById(tx.getOriginatingStoreId())
+                            .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "").orElse(""));
+            metadata.put("settlementMode", "hold-on-platform");
 
             final Map<String, Object> params = new HashMap<>();
             params.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
@@ -298,30 +234,11 @@ public class CheckoutController {
             params.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
             params.put("metadata", metadata);
 
-            if (canSplitTransfer) {
-                final Map<String, Object> transferData = new HashMap<>();
-                transferData.put("destination", fulfillingStore.getStripeConnectId());
-                transferData.put("amount", realTransfer);
-                final Map<String, Object> paymentIntentData = new HashMap<>();
-                paymentIntentData.put("transfer_data", transferData);
-                params.put("payment_intent_data", paymentIntentData);
-            } else {
-                log.warn("Split-ledger checkout tx={}: wholesale {} > retail {} or transfer cap {}; " +
-                                "using custody fallback (explicit Transfers after payment).",
-                        tx.getId(), wholesaleCents, retailCents, realTransfer);
-                metadata.put("splitFallback", "wholesale-exceeds-retail; explicit Transfers will reconcile after custody proof.");
-                metadata.put("fulfillingConnectId", fulfillingStore.getStripeConnectId());
-                metadata.put("originatingConnectId",
-                        storeRepository.findById(tx.getOriginatingStoreId())
-                                .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "").orElse(""));
-                metadata.put("wholesalePayoutCents", String.valueOf(wholesaleCents));
-                metadata.put("arbitrageMarginCents", String.valueOf(tx.getArbitrageMarginCents()));
-                if (platformFeeCents > 0) {
-                    final Map<String, Object> paymentIntentData = new HashMap<>();
-                    paymentIntentData.put("application_fee_amount", platformFeeCents);
-                    params.put("payment_intent_data", paymentIntentData);
-                }
-            }
+            // Shared transfer_group across the charge and the pickup-time transfers so the whole
+            // lifecycle can be reconciled (and reversed) as one group.
+            final Map<String, Object> paymentIntentData = new HashMap<>();
+            paymentIntentData.put("transfer_group", "tx_" + tx.getId().toString());
+            params.put("payment_intent_data", paymentIntentData);
 
             if (request.getCustomerEmail() != null && !request.getCustomerEmail().isBlank()) {
                 params.put("customer_email", request.getCustomerEmail());
@@ -334,75 +251,11 @@ public class CheckoutController {
                     .id(session.getId())
                     .url(session.getUrl())
                     .status("ok")
+                    .message("Funds held on platform; wholesale and margin transfers execute at pickup.")
                     .build());
         } catch (StripeException ex) {
-            String msg = ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage();
-            log.warn("Split-ledger checkout create failed for tx={} ({}). Attempting fallback without declarative transfer_data" +
-                    " — wholesale & margin will be issued via explicit Transfers after custody proof.", request.getTransactionId(), msg);
-
-            try {
-                final List<String> images2 = new ArrayList<>();
-                if (imageUrl != null && !imageUrl.isBlank()) images2.add(imageUrl);
-                final Map<String, Object> productData2 = new HashMap<>();
-                productData2.put("name", productTitle);
-                if (!images2.isEmpty()) productData2.put("images", images2);
-                final Map<String, Object> priceData2 = new HashMap<>();
-                priceData2.put("currency", txCurrencyLower);
-                priceData2.put("unit_amount", tx.getTotalRetailCents());
-                priceData2.put("product_data", productData2);
-                final Map<String, Object> lineItem2 = new HashMap<>();
-                lineItem2.put("quantity", 1L);
-                lineItem2.put("price_data", priceData2);
-                final List<Object> lineItems2 = new ArrayList<>();
-                lineItems2.add(lineItem2);
-
-                final Map<String, String> meta2 = new HashMap<>();
-                meta2.put("transactionId", tx.getId().toString());
-                meta2.put("fulfillingConnectId", fulfillingStore.getStripeConnectId());
-                meta2.put("originatingConnectId",
-                        storeRepository.findById(tx.getOriginatingStoreId())
-                                .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "").orElse(""));
-                meta2.put("wholesalePayoutCents", String.valueOf(tx.getWholesalePayoutCents()));
-                meta2.put("arbitrageMarginCents", String.valueOf(tx.getArbitrageMarginCents()));
-                meta2.put("splitFallback", "declarative-transfer-failed; explicit Transfers will reconcile after custody proof.");
-
-                final Map<String, Object> params2 = new HashMap<>();
-                params2.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
-                params2.put("success_url", request.getSuccessUrl());
-                params2.put("cancel_url", request.getCancelUrl());
-                params2.put("line_items", lineItems2);
-                params2.put("allow_promotion_codes", Boolean.TRUE);
-                params2.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
-                params2.put("metadata", meta2);
-
-                if (platformContractService.isFeeBased()) {
-                    long fallbackFee = platformContractService.computePlatformFeeCents(
-                            tx.getArbitrageMarginCents() != null ? tx.getArbitrageMarginCents() : 0);
-                    if (fallbackFee > 0) {
-                        final Map<String, Object> pid2 = new HashMap<>();
-                        pid2.put("application_fee_amount", fallbackFee);
-                        params2.put("payment_intent_data", pid2);
-                    }
-                }
-
-                if (request.getCustomerEmail() != null && !request.getCustomerEmail().isBlank()) {
-                    params2.put("customer_email", request.getCustomerEmail());
-                }
-
-                assertSingleLineItemOnly(params2);
-                final Session fallback = Session.create(params2);
-                return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
-                        .id(fallback.getId())
-                        .url(fallback.getUrl())
-                        .status("ok_fallback_split")
-                        .message("Fallback: platform will issue explicit wholesale + margin transfers after custody proof.")
-                        .build());
-            } catch (StripeException fallbackEx) {
-                log.error("Fallback checkout also failed for tx={}", request.getTransactionId(), fallbackEx);
-                msg = fallbackEx.getUserMessage() != null ? fallbackEx.getUserMessage() : fallbackEx.getMessage();
-            }
-
             log.error("Failed creating Stripe Checkout Session for tx={}", request.getTransactionId(), ex);
+            final String msg = ex.getUserMessage() != null ? ex.getUserMessage() : ex.getMessage();
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(CheckoutSessionResponse.builder()
                     .status("error")
                     .message(msg)
@@ -636,11 +489,6 @@ public class CheckoutController {
                 params.put("customer_email", request.getCustomerEmail());
             }
 
-            final String fulfillConnectId = fulfillingStore.getStripeConnectId();
-            final boolean transfersCapable = fulfillConnectId != null
-                    && !fulfillConnectId.isBlank()
-                    && !fulfillConnectId.startsWith("acct_connected_");
-
             final Map<String, String> metadata = new HashMap<>();
             metadata.put("transactionId", saved.getId().toString());
             metadata.put("productId", productId.toString());
@@ -649,61 +497,30 @@ public class CheckoutController {
             metadata.put("fulfillingStoreId", fulfillingStoreId.toString());
             metadata.put("wholesalePayoutCents", String.valueOf(wholesaleCents));
             metadata.put("arbitrageMarginCents", String.valueOf(marginCents));
+            metadata.put("fulfillingConnectId",
+                    fulfillingStore.getStripeConnectId() != null ? fulfillingStore.getStripeConnectId() : "");
+            metadata.put("originatingConnectId",
+                    originatingStore.getStripeConnectId() != null ? originatingStore.getStripeConnectId() : "");
+            metadata.put("settlementMode", "hold-on-platform");
 
-            if (transfersCapable) {
-                try {
-                    final int platformFeeCents;
-                    if (platformContractService.isFeeBased()) {
-                        platformFeeCents = platformContractService.computePlatformFeeCents(marginCents);
-                    } else {
-                        platformFeeCents = 0;
-                    }
-                    final int transferCap = Math.max(0, retailCents - platformFeeCents);
-                    final int realTransfer = Math.min(wholesaleCents, transferCap);
-                    if (realTransfer <= 0 || wholesaleCents > retailCents) {
-                        throw new IllegalStateException("Wholesale payout exceeds retail amount — using custody fallback.");
-                    }
-                    final Map<String, Object> transferData = new HashMap<>();
-                    transferData.put("destination", fulfillConnectId);
-                    transferData.put("amount", realTransfer);
-                    final Map<String, Object> paymentIntentData = new HashMap<>();
-                    paymentIntentData.put("transfer_data", transferData);
-                    params.put("payment_intent_data", paymentIntentData);
-                    params.put("metadata", metadata);
-                    assertSingleLineItemOnly(params);
-                    final Session session = Session.create(params);
-                    return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
-                            .id(session.getId())
-                            .url(session.getUrl())
-                            .status("ok")
-                            .build());
-                } catch (StripeException | IllegalStateException primaryEx) {
-                    final String msg = (primaryEx instanceof StripeException sex)
-                            ? (sex.getUserMessage() != null ? sex.getUserMessage() : sex.getMessage())
-                            : primaryEx.getMessage();
-                    log.warn("Primary direct checkout split transfer failed for product {} ({}). " +
-                            "Falling back to custody-style payout after payment.", productId, msg);
-                    metadata.put("splitFallback", "capability-or-amount-error; explicit Transfers will reconcile after custody proof.");
-                    metadata.put("fulfillingConnectId", fulfillConnectId);
-                    metadata.put("originatingConnectId",
-                            storeRepository.findById(originatingStoreId)
-                                    .map(s -> s.getStripeConnectId() != null ? s.getStripeConnectId() : "")
-                                    .orElse(""));
-                }
-            }
-
+            // Payment Flow 2 — Hold on Platform & Split at Product Pickup.
+            // No declarative transfer_data is attached; the platform holds the full retail amount
+            // and executes wholesale + margin transfers explicitly when the product is picked up.
             params.put("metadata", metadata);
+
+            // Shared transfer_group across the charge and the pickup-time transfers.
+            final Map<String, Object> paymentIntentData = new HashMap<>();
+            paymentIntentData.put("transfer_group", "tx_" + saved.getId().toString());
+            params.put("payment_intent_data", paymentIntentData);
+
             assertSingleLineItemOnly(params);
             final Session session = Session.create(params);
 
             return ResponseEntity.status(HttpStatus.CREATED).body(CheckoutSessionResponse.builder()
                     .id(session.getId())
                     .url(session.getUrl())
-                    .status(transfersCapable ? "ok_fallback_split" : "ok")
-                    .message(transfersCapable
-                            ? "Fallback: declarative split transfer unavailable for destination account. " +
-                            "Platform will issue explicit wholesale + margin transfers after payment custody."
-                            : null)
+                    .status("ok")
+                    .message("Funds held on platform; wholesale and margin transfers execute at pickup.")
                     .build());
         } catch (IllegalArgumentException iae) {
             log.error("Invalid UUID in checkout request for productId={}", request.getProductId(), iae);
@@ -805,11 +622,7 @@ public class CheckoutController {
                         new ConfirmSessionPaidResponse("error", "Invalid transactionId in session metadata",
                                 null, null, session.getPaymentIntent(), false));
             }
-            final boolean explicitPayouts = meta != null
-                    && (meta.get("splitFallback") != null
-                        || "true".equalsIgnoreCase(meta.get("splitFallback"))
-                        || meta.get("fulfillingConnectId") != null);
-            checkoutService.finalizeTransactionPaidAfterStripe(txId, session.getPaymentIntent(), explicitPayouts);
+            checkoutService.finalizeTransactionPaidAfterStripe(txId, session.getPaymentIntent());
             final Transaction tx = transactionRepository.findById(txId).orElse(null);
             return ResponseEntity.status(HttpStatus.OK).body(
                     new ConfirmSessionPaidResponse("ok", "Session confirmed finalized to PAID.",

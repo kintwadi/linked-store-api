@@ -21,6 +21,12 @@ public class PickupVerifyResponse {
     private UUID marginToStoreId;
     private String marginToStoreConnectId;
     private String stripeTransferId;
+    // Payment Flow 2 settlement details
+    private Integer wholesaleAmountCents;
+    private UUID wholesaleToStoreId;
+    private String wholesaleTransferId;
+    private Integer marginToOriginatingCents;
+    private Integer platformFeeCents;
     private String qrScannedAt;
     private String message;
 }
