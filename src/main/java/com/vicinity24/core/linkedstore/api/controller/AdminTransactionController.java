@@ -86,7 +86,7 @@ public class AdminTransactionController {
     public ResponseEntity<?> listRunnerPickups(
             @RequestParam(name = "page", defaultValue = "0") int page,
             @RequestParam(name = "pageSize", defaultValue = "25") int pageSize,
-            @RequestParam(name = "status", required = false, defaultValue = "PAID") String status) {
+            @RequestParam(name = "status", required = false, defaultValue = "READY_FOR_PICKUP") String status) {
 
         if (page < 0) page = 0;
         if (pageSize <= 0) pageSize = 25;
@@ -110,15 +110,9 @@ public class AdminTransactionController {
 
         final boolean globalAdmin = current.isGlobalAdmin();
 
-        TransactionStatus requestedStatus;
-        try {
-            requestedStatus = status != null && !status.isBlank()
-                    ? TransactionStatus.valueOf(status)
-                    : TransactionStatus.PAID;
-        } catch (IllegalArgumentException iae) {
-            requestedStatus = TransactionStatus.PAID;
-        }
-        final TransactionStatus finalStatus = requestedStatus;
+        final String requestedStatus = status != null && !status.isBlank()
+                ? status.trim().toUpperCase(Locale.ROOT)
+                : "READY_FOR_PICKUP";
         final UUID finalRunnerUserId = runnerUserId;
         final Set<UUID> finalStoreIds = myStoreIds;
 
@@ -130,7 +124,20 @@ public class AdminTransactionController {
         Specification<Transaction> runnerSpec = (root, query, cb) -> {
             List<Predicate> predicates = new ArrayList<>();
 
-            predicates.add(cb.equal(root.get("status"), finalStatus));
+            if ("READY_FOR_PICKUP".equals(requestedStatus)) {
+                // Treat both store-ready and fully-paid items as pickup-queue candidates so the
+                // runner queue is populated as soon as payment succeeds, while still tolerating a
+                // short-lived payment-sync race between the checkout success page and webhook.
+                predicates.add(root.get("status").in(TransactionStatus.PAID, TransactionStatus.READY));
+            } else {
+                TransactionStatus exactStatus;
+                try {
+                    exactStatus = TransactionStatus.valueOf(requestedStatus);
+                } catch (IllegalArgumentException iae) {
+                    exactStatus = TransactionStatus.PAID;
+                }
+                predicates.add(cb.equal(root.get("status"), exactStatus));
+            }
 
             Predicate assignedToMe = cb.equal(root.get("runnerId"), finalRunnerUserId);
 
