@@ -309,13 +309,13 @@ public class AdminTransactionController {
     private TransactionResponse buildTransactionResponse(Transaction tx, CurrentUser current) {
         UUID txId = tx.getId();
 
-        String originatingStoreName = storeRepository.findById(tx.getOriginatingStoreId())
-                .map(Store::getBusinessName)
-                .orElse(null);
+        Store originatingStore = storeRepository.findById(tx.getOriginatingStoreId()).orElse(null);
+        String originatingStoreName = originatingStore != null ? originatingStore.getBusinessName() : null;
+        String originatingStoreAddress = formatStoreAddress(originatingStore);
 
-        String fulfillingStoreName = storeRepository.findById(tx.getFulfillingStoreId())
-                .map(Store::getBusinessName)
-                .orElse(null);
+        Store fulfillingStore = storeRepository.findById(tx.getFulfillingStoreId()).orElse(null);
+        String fulfillingStoreName = fulfillingStore != null ? fulfillingStore.getBusinessName() : null;
+        String fulfillingStoreAddress = formatStoreAddress(fulfillingStore);
 
         UUID variantId = inventoryLockRepository.findByTransactionId(txId).stream()
                 .findFirst()
@@ -404,8 +404,10 @@ public class AdminTransactionController {
                 .status(tx.getStatus().name())
                 .originatingStoreId(tx.getOriginatingStoreId())
                 .originatingStoreName(originatingStoreName)
+                .originatingStoreAddress(originatingStoreAddress)
                 .fulfillingStoreId(tx.getFulfillingStoreId())
                 .fulfillingStoreName(fulfillingStoreName)
+                .fulfillingStoreAddress(fulfillingStoreAddress)
                 .stripePaymentIntentId(tx.getStripePaymentIntentId())
                 .totalRetailCents(tx.getTotalRetailCents())
                 .wholesalePayoutCents(tx.getWholesalePayoutCents())
@@ -426,6 +428,24 @@ public class AdminTransactionController {
                 .perspectiveRole(perspectiveRole)
                 .perspectiveStoreId(perspectiveStoreId)
                 .build();
+    }
+
+    private static String formatStoreAddress(Store store) {
+        if (store == null) return null;
+        List<String> parts = new ArrayList<>();
+        if (store.getAddress() != null && !store.getAddress().isBlank()) {
+            parts.add(store.getAddress().trim());
+        }
+        String postal = store.getPostalCode() != null ? store.getPostalCode().trim() : "";
+        String country = store.getCountryCode() != null ? store.getCountryCode().trim().toUpperCase(Locale.ROOT) : "";
+        String tail = Stream.of(postal, country)
+                .filter(s -> s != null && !s.isBlank())
+                .collect(Collectors.joining(" · "));
+        if (!tail.isBlank()) {
+            parts.add(tail);
+        }
+        if (parts.isEmpty()) return null;
+        return String.join(", ", parts);
     }
 
     private String resolveTxCurrencyUpper(UUID fulfillingStoreId) {
