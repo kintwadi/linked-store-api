@@ -17,8 +17,10 @@ public class TransactionResponse {
     private String status;
     private UUID originatingStoreId;
     private String originatingStoreName;
+    private String originatingStoreAddress;
     private UUID fulfillingStoreId;
     private String fulfillingStoreName;
+    private String fulfillingStoreAddress;
     private String stripePaymentIntentId;
     private Integer totalRetailCents;
     private Integer wholesalePayoutCents;
