@@ -15,6 +15,8 @@ import com.vicinity24.core.linkedstore.api.repository.ProductVariantRepository;
 import com.vicinity24.core.linkedstore.api.repository.QrTokenRepository;
 import com.vicinity24.core.linkedstore.api.repository.StoreRepository;
 import com.vicinity24.core.linkedstore.api.repository.TransactionRepository;
+import com.vicinity24.core.linkedstore.api.security.AuthenticationFacade;
+import com.vicinity24.core.linkedstore.api.security.CurrentUser;
 import com.vicinity24.core.linkedstore.api.service.CheckoutService;
 import com.vicinity24.core.linkedstore.api.service.TransactionEventBroadcaster;
 import lombok.RequiredArgsConstructor;
@@ -44,6 +46,7 @@ public class PickupController {
     private final ProductVariantRepository productVariantRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
     private final CheckoutService checkoutService;
+    private final AuthenticationFacade authenticationFacade;
 
     private static String resolveStoreCurrencyLower(Store store) {
         if (store == null) return "usd";
@@ -56,6 +59,31 @@ public class PickupController {
     @Transactional
     public ResponseEntity<PickupVerifyResponse> verify(
             @RequestBody PickupVerifyRequest request) {
+
+        final CurrentUser current = authenticationFacade.current();
+        if (current == null || !current.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(PickupVerifyResponse.builder()
+                    .status("unauthorized")
+                    .message("Authentication is required to verify pickup.")
+                    .build());
+        }
+        if (current.getStoreId() == null || current.getRole() == null) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(PickupVerifyResponse.builder()
+                    .status("forbidden")
+                    .message("Only store staff above runner can verify pickup.")
+                    .build());
+        }
+        switch (current.getRole()) {
+            case OWNER, STORE_ADMIN, STORE_REPRESENTATIVE, CLERK -> {
+                // allowed
+            }
+            default -> {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(PickupVerifyResponse.builder()
+                        .status("forbidden")
+                        .message("Only store staff above runner can verify pickup.")
+                        .build());
+            }
+        }
 
         final String secureToken = (request.getSecureToken() != null) ? request.getSecureToken().trim() : null;
         final String fallbackCode = (request.getFallbackCode() != null) ? request.getFallbackCode().trim() : null;
@@ -108,6 +136,12 @@ public class PickupController {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(PickupVerifyResponse.builder()
                     .status("wrong_state")
                     .message("Transaction must be paid before verifying pickup. Current status: " + tx.getStatus().name())
+                    .build());
+        }
+        if (!tx.getFulfillingStoreId().equals(current.getStoreId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(PickupVerifyResponse.builder()
+                    .status("forbidden")
+                    .message("Only the fulfilling store can verify this pickup.")
                     .build());
         }
 
