@@ -71,7 +71,7 @@ A single retail price is split three ways. In **Payment Flow 2 ("Hold on Platfor
 | Arbitrage margin (Transfer B) | Originating store (broker), minus platform fee | At **pickup / custody proof** | `Transfer.create(source_transaction)` |
 | Platform fee | Platform | **Residual** — never transferred; simply remains on the platform balance | — |
 
-All three legs share the transaction's `transfer_group` (`tx_<transactionId>`), which is also set on the charge itself, so the whole lifecycle can be reconciled (and reversed) as one group.
+All three legs share the transaction's `transfer_group` (`tx_<transactionId>`), which is also set on the charge itself, so the whole lifecycle can be reconciled (and reversed) as one group. The platform fee is an accounting leg, not a third Stripe `Transfer`: it remains on the marketplace's main Stripe platform account as retained balance.
 
 ### End-to-end sequence
 
@@ -296,7 +296,7 @@ Same as Step 1 → `storeA.stripeConnectId = "acct_originA"`.
    - Resolves the original charge `ch_...` from the payment intent.
    - **Transfer A:** `Transfer { amount: 1200, destination: "acct_fulfillB", transferGroup: "tx_<id>", source_transaction: "ch_...", metadata.route: "WHOLESALE_TO_FULFILLING" }` → **$12 wholesale to Store B**.
    - **Transfer B:** `Transfer { amount: 720, destination: "acct_originA", transferGroup: "tx_<id>", source_transaction: "ch_...", metadata.route: "MARGIN_TO_ORIGINATING" }` → **$7.20 net margin to Store A**.
-   - The **$0.80 platform fee is the residual** that stays on the platform balance.
+   - The **$0.80 platform fee is the residual** that stays on the main platform balance. No third Stripe transfer is created for the platform.
 4. Response: `{ status: "settled", wholesaleTransferId: "tr_...A", stripeTransferId: "tr_...B", platformFeeCents: 80 }`.
 
 ### Final money positions

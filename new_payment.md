@@ -16,7 +16,7 @@ The system is built on **Stripe Connect** using **Separate Charges and Transfers
 3. **Pickup Trigger:** Upon verified product pickup, the platform executes two distinct transfers using a shared `transfer_group`:
    * **Transfer A:** The specified payout amount goes to the Product Owner Store.
    * **Transfer B:** The brokerage/arbitrage cut goes to the Selling Store.
-   * **Residual:** The remaining amount naturally stays in the platform account as the marketplace monetization fee.
+   * **Residual:** The remaining amount naturally stays in the platform's main Stripe account as the marketplace monetization fee; it is not sent through a separate platform connected account.
 
 ### Scenario 2: Immediate Pay to Owner, Deferred Pay to Arbitrage/Platform
 1. **Checkout:** The platform charges the customer's card. The Product Owner Store receives its payout immediately into its connected account.

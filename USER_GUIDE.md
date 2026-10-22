@@ -109,8 +109,8 @@ Before a store can receive split-ledger payouts its owner must complete Stripe E
 ![Stripe Express onboarding](artifacts/02_stripe_express_onboarding.png)
 ![Onboarding list](artifacts/01_store_onboarding_list.png)
 
-### Platform payout account (FEE_BASED mode)
-When the platform runs in **FEE_BASED** contract mode, the service fee collected on each transaction must be paid out to the platform's own Stripe connected account. The **Global Admin** sets this account ID (`acct_...`) on the **Contract** tab of the admin dashboard. If left blank, the platform's default Stripe account receives the fee.
+### Platform fee retention (FEE_BASED mode)
+When the platform runs in **FEE_BASED** contract mode, the service fee is retained on the marketplace's **main Stripe platform account** as the residual left after pickup settlement. The Global Admin only manages the contract mode and fee percentage in the dashboard. No separate platform Stripe Connect onboarding is required.
 
 ---
 
@@ -229,13 +229,12 @@ This tab controls the platform's revenue contract. **Only Global Admins** can se
 
 | Mode | What it means |
 |---|---|
-| **Fee-based** | Platform takes a % service fee on the originating store's arbitrage margin. No store subscription needed. The Subscription tab is hidden in store dashboards. The service fee is shown on the checkout page. |
+| **Fee-based** | Platform takes a % service fee on the originating store's arbitrage margin. No store subscription needed. The Subscription tab is hidden in store dashboards. The fee is retained from the margin at pickup settlement and is not shown to the customer as an extra line item. |
 | **Subscription-based** | No platform fee collected. Every store must have an active subscription (ACTIVE / TRIALING / PAST_DUE) to originate or fulfill transactions. The Subscription tab is shown in store dashboards. |
 | **Disabled (none)** | Neither fee nor subscription is configured. **All store transactions are blocked** until a mode is selected. |
 
 **Fields** (visible depending on mode):
-- **Service fee percentage** (0–100): the % of the originating store's margin collected as platform fee. Only used in Fee-based mode.
-- **Platform payout Stripe Connect ID** (`acct_...`): the connected account that receives platform service-fee payouts. Only used in Fee-based mode. Leave blank to use the platform's default Stripe account.
+- **Service fee percentage** (0–100): the % of the originating store's margin collected as platform fee. Only used in Fee-based mode. The fee remains on the main platform Stripe account when pickup settlement runs.
 
 > The two modes are enforced as mutually exclusive both at boot (env vars) and at runtime (this form). If both env vars are set to `enabled`, the backend falls back to **Fee-based** and logs an error.
 
@@ -399,8 +398,8 @@ Requires at least `STORE_ADMIN` for the target store (or GLOBAL_ADMIN). `{storeI
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/public` | public | Returns `{ mode, feePercentage, isConfigured }`. Used by the checkout page and store dashboards to decide UI (e.g. show service fee, hide subscription tab). |
-| GET | `/admin` | **GLOBAL_ADMIN only** | Returns the full contract including `platformPayoutConnectId` and `updatedAt`. |
-| PUT | `/admin` | **GLOBAL_ADMIN only** | Updates the contract. Body: `{ mode: "FEE_BASED" \| "SUBSCRIPTION" \| "NONE", feePercentage: number, platformPayoutConnectId: string \| null }`. Mode is inherently single-select so mutual exclusion is guaranteed. |
+| GET | `/admin` | **GLOBAL_ADMIN only** | Returns the full contract and `updatedAt`. |
+| PUT | `/admin` | **GLOBAL_ADMIN only** | Updates the contract. Body: `{ mode: "FEE_BASED" \| "SUBSCRIPTION" \| "NONE", feePercentage: number }`. Mode is inherently single-select so mutual exclusion is guaranteed. |
 
 > Both the originating (Host) and fulfilling (Neighbor) stores must pass the contract gate before any reservation or checkout can proceed:
 > - **FEE_BASED** → both stores always eligible (no subscription needed).
