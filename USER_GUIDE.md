@@ -57,57 +57,63 @@ ng serve --host 127.0.0.1 --host 192.168.178.114 --port 4200
 ### Step 1. Explore the map / QR directory (Home)
 Landing page shows stores nearby as QR codes — scan or tap to enter a store:
 
-![Home QR explore](artifacts/03_home_page_qr_explore.png)
+![Home QR explore](../artifacts/03_home_page_qr_explore.png)
 
 ### Step 2. Product detail page — "Request Now" countdown
 Tap any product. You'll see a countdown timer, images, and a **Request Now** button that locks the current neighbor price for a short reservation window:
 
-![Air Max PDP countdown](artifacts/04_pdp_airmax_requestnow.png)
+![Air Max PDP countdown](../artifacts/04_pdp_airmax_requestnow.png)
 
-![Air Force 1 PDP countdown](artifacts/05_pdp_airforce1_requestnow.png)
+![Air Force 1 PDP countdown](../artifacts/05_pdp_airforce1_requestnow.png)
 
 ### Step 3. Checkout — Split-ledger overview
 The checkout page clearly shows the Host (originator margin) vs Neighbor (fulfillment, wholesale) split, total, and both **QR-code pickup** and **8-digit numeric fallback** codes:
 
-![A/B split ledger](artifacts/06_checkout_ledger_ab_split.png)
+![A/B split ledger](../artifacts/06_checkout_ledger_ab_split.png)
 
-![Ultraboost ledger](artifacts/07_checkout_ultraboost_ledger.png)
+![Ultraboost ledger](../artifacts/07_checkout_ultraboost_ledger.png)
 
-![QR + 8-digit fallback side-by-side](artifacts/12_checkout_qr_and_8digit_code.png)
+![QR + 8-digit fallback side-by-side](../artifacts/12_checkout_qr_and_8digit_code.png)
 
-> When the platform is in **FEE_BASED** contract mode, the order summary includes a **"Platform service fee (X%)"** line item. This fee is deducted from the originating (Host) store's arbitrage margin — it is **not** added to the customer's total. The customer still pays the full retail price; the platform takes its cut from the margin before the remaining margin is transferred to the Host store.
+> When the platform is in **FEE_BASED** contract mode, the customer still sees and pays a single checkout total. The platform fee is taken from the originating (Host) store's arbitrage margin during pickup settlement; it is not added on top of the customer's price and is not required as a separate customer-facing line item.
 
 ### Step 4. Pay (Stripe hosted checkout)
 Clicking **Pay** redirects you to a Stripe hosted checkout session:
 
-![Stripe $189](artifacts/08_stripe_hosted_checkout_$189.png)
+![Stripe $189](../artifacts/08_stripe_hosted_checkout_$189.png)
 
 After successful payment you return to a success page:
 
-![Checkout success](artifacts/09_checkout_success_green.png)
+![Checkout success](../artifacts/09_checkout_success_green.png)
 
-> Internally the split-ledger is applied: the **neighbor store's Stripe Connect** account receives the wholesale amount *declaratively* via `SessionCreateParams.destination`, and the **host store** receives their margin via a `Transfer.create` after pickup is verified (fallback safe-bytes pattern if capabilities are missing: amounts embedded in metadata and two explicit `Transfer.create` are issued post-pickup). In **FEE_BASED** contract mode the platform also takes a percentage service fee from the host store's margin before the remainder is transferred to the host. In **SUBSCRIPTION** mode no platform fee is collected.
+> Internally the platform uses **Separate Charges and Transfers** in **"Hold on Platform & Split at Product Pickup"** mode. When the customer pays, the **full retail amount is captured and held on the platform's primary Stripe account**. No money moves to either store at checkout. At verified pickup the platform creates exactly two transfers under the transaction's shared `transfer_group`: wholesale to the fulfilling store, and net margin to the originating store. In **FEE_BASED** contract mode the platform fee remains as retained balance on the main platform account. In **SUBSCRIPTION** mode no platform fee is retained.
 
 ### Step 5. Merchant pickup — QR (secure) or 8-digit code (fallback)
 The staff member at the fulfillment store opens the merchant pickup page. They can either **scan the shopper's QR code** (primary, cryptographically signed pickup token), or the shopper can read their **8-digit numeric code**:
 
-![Merchant pickup page](artifacts/10_merchant_pickup_page.png)
+![Merchant pickup page](../artifacts/10_merchant_pickup_page.png)
 
 After either input succeeds the merchant sees a green settled confirmation:
 
-![Merchant settled result](artifacts/11_merchant_settled_result.png)
+![Merchant settled result](../artifacts/11_merchant_settled_result.png)
+
+> **Settlement happens here, at verified pickup.** Once custody is proven the platform executes two Stripe transfers that share the transaction's `transfer_group` (`tx_<transactionId>`):
+> 1. **Transfer A — Wholesale → Product Owner (fulfilling store).** The amount the owner earns for the item.
+> 2. **Transfer B — Margin → Brokerage (originating store).** The arbitrage cut, **minus the platform service fee** when the platform is in **FEE_BASED** mode.
+>
+> The **platform service fee is the residual** that naturally stays on the platform account (FEE_BASED mode only). In **SUBSCRIPTION** mode no fee is retained and the platform transfers the full margin to the brokerage store.
 
 The **fallback 8-digit code path** (anti-replay protected, one-time, server-verified without the QR signature) returns a verified result identical to the QR path:
 
-![Fallback code verified](artifacts/13_merchant_fallback_code_verified.png)
+![Fallback code verified](../artifacts/13_merchant_fallback_code_verified.png)
 
 ---
 
 ## 3. Merchant — Stripe Connect Onboarding
 Before a store can receive split-ledger payouts its owner must complete Stripe Express onboarding. As a **store admin** log in, navigate to the store dashboard, and complete onboarding. As Global Admin you can see onboarding status per store (column **Onboarded** on the admin Stores tab).
 
-![Stripe Express onboarding](artifacts/02_stripe_express_onboarding.png)
-![Onboarding list](artifacts/01_store_onboarding_list.png)
+![Stripe Express onboarding](../artifacts/02_stripe_express_onboarding.png)
+![Onboarding list](../artifacts/01_store_onboarding_list.png)
 
 ### Platform fee retention (FEE_BASED mode)
 When the platform runs in **FEE_BASED** contract mode, the service fee is retained on the marketplace's **main Stripe platform account** as the residual left after pickup settlement. The Global Admin only manages the contract mode and fee percentage in the dashboard. No separate platform Stripe Connect onboarding is required.
@@ -117,7 +123,7 @@ When the platform runs in **FEE_BASED** contract mode, the service fee is retain
 ## 4. Store Sign-up — Become a Store Admin
 Go to **`/signup`** (accessible from the footer of the Log in page). The sign-up form has **two sections**: user credentials and store information, with the **`Login as admin for this store`** checkbox (ticked by default — this grants you `STORE_ADMIN` on the freshly created store):
 
-![Sign-up form](artifacts/14_signup_page_form.png)
+![Sign-up form](../artifacts/14_signup_page_form.png)
 
 ### Fields
 
@@ -140,7 +146,7 @@ Go to **`/signup`** (accessible from the footer of the Log in page). The sign-up
 
 Click **Sign up**. If **Login as admin** was checked you are **immediately issued a JWT pair** (access + refresh) and auto-redirected to **`/admin`** where you see **only your own store**:
 
-![Store admin own-store dashboard](artifacts/15_store_admin_dashboard_own_store.png)
+![Store admin own-store dashboard](../artifacts/15_store_admin_dashboard_own_store.png)
 
 > **Data isolation is absolute.** A store admin (or any store user) will never see users, stores, or transactions belonging to another store. Every list query is WHERE-filtered by `store_id`, additionally guarded by role-rank checks in `AuthenticationFacade`, and the Spring Security route matcher further restricts `/api/admin/stores/**` to `ROLE_GLOBAL_ADMIN` only.
 
@@ -150,7 +156,7 @@ Click **Sign up**. If **Login as admin** was checked you are **immediately issue
 
 Navigate to **`/login`**:
 
-![Login page](artifacts/16_login_page.png)
+![Login page](../artifacts/16_login_page.png)
 
 Enter credentials. After successful login:
 - If your role is **GLOBAL_ADMIN**, **STORE_ADMIN**, or **OWNER** → you land on `/admin`.
@@ -181,7 +187,7 @@ The `/admin` page exposes the following tabs. What you see depends on your role:
 
 Global Admin view (7 stores seeded from prior runs):
 
-![Global admin stores table](artifacts/17_global_admin_stores_table_all_stores_edit_suspend.png)
+![Global admin stores table](../artifacts/17_global_admin_stores_table_all_stores_edit_suspend.png)
 
 ### 6.2 Users tab — Manage store operators
 
@@ -192,7 +198,7 @@ Global Admin view (7 stores seeded from prior runs):
 
 Click the **`+ Add user`** expandable card to open the create-user form:
 
-![Users + add user expanded](artifacts/18_admin_users_tab_add_user_expanded.png)
+![Users + add user expanded](../artifacts/18_admin_users_tab_add_user_expanded.png)
 
 Available **Roles** (enforced rank in `AuthenticationFacade.requireAtLeastRole(...)`):
 
@@ -214,7 +220,7 @@ Every transaction visible on this tab is already scope-filtered:
 
 Pagination controls at the bottom: **Prev / Next**. An empty starting state for a fresh store looks like this:
 
-![Transactions tab + pagination](artifacts/19_admin_transactions_tab_empty_pagination.png)
+![Transactions tab + pagination](../artifacts/19_admin_transactions_tab_empty_pagination.png)
 
 Columns shown in the table: **ID, Stores (Host ⇄ Neighbor), Status, Total, Created**. Rows are color-coded by status: green = completed/paid/settled, amber = pending/processing/hold, red = failed/cancelled/refund, blue = anything else.
 
@@ -253,13 +259,13 @@ When you log in as a **store admin** (or click the **🏬 Store Admin** button o
 | STORE_ADMIN or OWNER | After login you land on `/admin`. Your store card shows a **🏬 Store Dashboard** link → opens `/admin/stores/me/products`. |
 | GLOBAL_ADMIN | `/admin` → Stores tab → every row has a **🏬 Store Admin** action → opens that store's dashboard. |
 
-![Store admin own-store dashboard (before)](artifacts/15_store_admin_dashboard_own_store.png)
+![Store admin own-store dashboard (before)](../artifacts/15_store_admin_dashboard_own_store.png)
 
 ### 7.2 Tab 1 — 📦 Products & Inventory
 
 The default child route lists every product **variant** in your store (one row per size/color/SKU), with a cyan **🖼 N** pill that shows how many unique gallery images the product has (deduped across platform-level gallery + variant gallery):
 
-![Store products list with 🖼 gallery chips](artifacts/37_store_products_list_with_gallery_chip.png)
+![Store products list with gallery chips](../artifacts/37_store_products_list_with_gallery_chip.png)
 
 **Columns** — Product (cover image + title + short description + 🖼 chip), SKU, Retail $, Wholesale $, Stock (or blank if the variant doesn't track stock), Status (ACTIVE / DRAFT / ARCHIVED color-coded).
 Actions — **✎ Edit** on each row → opens the edit routed page; **＋ Add product** in the header → creates a new product.
@@ -273,7 +279,7 @@ All routed as real URLs (no modals):
 | New product | `/admin/stores/{storeId}/products/new` |
 | Edit variant | `/admin/stores/{storeId}/products/{variantId}` |
 
-![New product form — cover + gallery upload sections](artifacts/38_store_product_form_cover_gallery_sections.png)
+![New product form - cover and gallery upload sections](../artifacts/38_store_product_form_cover_gallery_sections.png)
 
 **Fields**
 
@@ -303,7 +309,7 @@ All routed as real URLs (no modals):
 
 Scoped to this store only: `/admin/stores/{storeId}/transactions`. Every reservation / payment this store has participated in — **either as Host (originator earning the margin) or as Neighbor / Fulfillment store (earning the wholesale)**.
 
-![Store transactions tab empty state](artifacts/39_store_transactions_tab_empty.png)
+![Store transactions tab empty state](../artifacts/39_store_transactions_tab_empty.png)
 
 Status color coding matches the Global Admin Transactions tab (green = completed/paid/settled, amber = pending/processing/hold, red = failed/cancelled/refund). As customers check out, rows are added with columns **ID, Stores (Host ⇄ Neighbor), Status, Total, Created**.
 
