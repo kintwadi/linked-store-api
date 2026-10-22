@@ -25,6 +25,7 @@ import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -189,6 +190,44 @@ public class PlatformContractController {
             body.put("message", sei.userMessage() != null ? sei.userMessage() : ex.getMessage());
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(body);
         }
+    }
+
+    @DeleteMapping("/admin/platform-account")
+    public ResponseEntity<Map<String, Object>> disconnectPlatformAccount() {
+        ensureStripeKey();
+        PlatformContract contract = contractService.getEffectiveContract();
+        String stripeConnectId = contract.getPlatformPayoutConnectId();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("previousStripeConnectId", stripeConnectId);
+
+        if (stripeConnectId == null || stripeConnectId.isBlank()) {
+            body.put("status", "ok");
+            body.put("stripeDeleted", false);
+            body.put("message", "No platform Stripe account was linked.");
+            return ResponseEntity.ok(body);
+        }
+
+        boolean stripeDeleted = false;
+        String message = "Platform Stripe account disconnected.";
+        try {
+            Account account = Account.retrieve(stripeConnectId);
+            account.delete();
+            stripeDeleted = true;
+            message = "Platform Stripe account removed from Stripe and disconnected.";
+            log.info("Platform contract: deleted platform Stripe Connect account {}", stripeConnectId);
+        } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
+            String stripeMessage = sei.userMessage() != null ? sei.userMessage() : ex.getMessage();
+            message = "Platform Stripe account was unlinked locally, but Stripe did not remove it. "
+                    + "You can still create a new account next time. Details: " + stripeMessage;
+            log.warn("Platform contract: unlinking {} after Stripe delete failed: {}", stripeConnectId, stripeMessage);
+        }
+
+        contractService.updateContract(contract.getMode(), contract.getFeePercentage(), null);
+        body.put("status", stripeDeleted ? "deleted" : "unlinked_with_warning");
+        body.put("stripeDeleted", stripeDeleted);
+        body.put("message", message);
+        return ResponseEntity.ok(body);
     }
 
     private void ensureStripeKey() {

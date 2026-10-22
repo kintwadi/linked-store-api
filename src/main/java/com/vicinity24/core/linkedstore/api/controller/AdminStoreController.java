@@ -156,6 +156,14 @@ public class AdminStoreController {
         return createLoginLink(store);
     }
 
+    @DeleteMapping("/me/connect/account")
+    @Transactional
+    public ResponseEntity<ConnectOnboardingResponse> disconnectMyStoreAccount() {
+        CurrentUser current = authenticationFacade.current();
+        Store store = resolveMyStore(current);
+        return disconnectConnectedAccount(store);
+    }
+
     @PostMapping("/me/invites")
     @Transactional
     public ResponseEntity<StoreInviteResponse> createInvite(
@@ -592,6 +600,16 @@ public class AdminStoreController {
         return createLoginLink(store);
     }
 
+    @DeleteMapping("/{id}/connect/account")
+    @Transactional
+    public ResponseEntity<ConnectOnboardingResponse> globalDisconnectLink(@PathVariable("id") UUID id) {
+        CurrentUser c = authenticationFacade.current();
+        permissionService.ensureCanManagePayouts(c, id);
+        Store store = storeRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Store", id.toString()));
+        return disconnectConnectedAccount(store);
+    }
+
     // ---------- helpers ----------
 
     private Store resolveMyStore(CurrentUser current) {
@@ -870,6 +888,46 @@ public class AdminStoreController {
                     .storeId(store.getId())
                     .build());
         }
+    }
+
+    private ResponseEntity<ConnectOnboardingResponse> disconnectConnectedAccount(Store store) {
+        ensureStripeKey();
+        String stripeConnectId = store.getStripeConnectId();
+        if (stripeConnectId == null || stripeConnectId.isBlank() || stripeConnectId.startsWith("acct_connected_")) {
+            store.setStripeConnectId("");
+            storeRepository.save(store);
+            return ResponseEntity.ok(ConnectOnboardingResponse.builder()
+                    .status("ok")
+                    .message("No Stripe account was linked. The store is ready for a fresh onboarding.")
+                    .storeId(store.getId())
+                    .build());
+        }
+
+        boolean stripeDeleted = false;
+        String message = "Stripe account disconnected.";
+        try {
+            Account account = Account.retrieve(stripeConnectId);
+            account.delete();
+            stripeDeleted = true;
+            message = "Stripe account removed from Stripe and disconnected.";
+            log.info("AdminConnect: deleted Stripe account {} for store {}", stripeConnectId, store.getId());
+        } catch (StripeException ex) {
+            StripeErrorInfo sei = StripeErrorInfo.from(ex);
+            String stripeMessage = sei.userMessage() != null ? sei.userMessage() : ex.getMessage();
+            message = "Stripe account was unlinked locally, but Stripe did not remove it. "
+                    + "A new onboarding can still be created next time. Details: " + stripeMessage;
+            log.warn("AdminConnect: unlinking store {} account {} after Stripe delete failed: {}",
+                    store.getId(), stripeConnectId, stripeMessage);
+        }
+
+        store.setStripeConnectId("");
+        storeRepository.save(store);
+        return ResponseEntity.ok(ConnectOnboardingResponse.builder()
+                .status(stripeDeleted ? "deleted" : "unlinked_with_warning")
+                .message(message)
+                .storeId(store.getId())
+                .stripeConnectId(stripeConnectId)
+                .build());
     }
 
     // ---------- tx status transitions (broadcasts SSE events) ----------
