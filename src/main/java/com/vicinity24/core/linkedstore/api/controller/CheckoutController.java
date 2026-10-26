@@ -42,7 +42,9 @@ import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.URLEncoder;
 import java.security.SecureRandom;
+import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -80,6 +82,21 @@ public class CheckoutController {
     private final StoreUserRepository storeUserRepository;
     private final TransactionEventBroadcaster eventBroadcaster;
     private final PlatformContractService platformContractService;
+
+    private static String appendQueryParam(String url, String name, String value) {
+        if (url == null || url.isBlank() || name == null || name.isBlank() || value == null || value.isBlank()) {
+            return url;
+        }
+        String base = url;
+        String fragment = "";
+        int hashIdx = url.indexOf('#');
+        if (hashIdx >= 0) {
+            base = url.substring(0, hashIdx);
+            fragment = url.substring(hashIdx);
+        }
+        String encoded = URLEncoder.encode(value, StandardCharsets.UTF_8);
+        return base + (base.contains("?") ? "&" : "?") + name + "=" + encoded + fragment;
+    }
 
     @PostMapping("/sessions")
     public ResponseEntity<CheckoutSessionResponse> createSession(
@@ -228,7 +245,7 @@ public class CheckoutController {
             final Map<String, Object> params = new HashMap<>();
             params.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
             params.put("success_url", request.getSuccessUrl());
-            params.put("cancel_url", request.getCancelUrl());
+            params.put("cancel_url", appendQueryParam(request.getCancelUrl(), "txId", tx.getId().toString()));
             params.put("line_items", lineItems);
             params.put("allow_promotion_codes", Boolean.TRUE);
             params.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
@@ -480,7 +497,7 @@ public class CheckoutController {
             final Map<String, Object> params = new HashMap<>();
             params.put("mode", SessionCreateParams.Mode.PAYMENT.getValue());
             params.put("success_url", request.getSuccessUrl());
-            params.put("cancel_url", request.getCancelUrl());
+            params.put("cancel_url", appendQueryParam(request.getCancelUrl(), "txId", saved.getId().toString()));
             params.put("line_items", lineItems);
             params.put("allow_promotion_codes", Boolean.TRUE);
             params.put("billing_address_collection", SessionCreateParams.BillingAddressCollection.AUTO.getValue());
